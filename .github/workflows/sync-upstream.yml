@@ -1,0 +1,30 @@
+name: Sync Upstream
+
+# 每天 01:00 UTC（北京时间 09:00）自动同步上游仓库，也可手动触发
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          # 使用默认 GITHUB_TOKEN，即可以推送代码
+
+      - name: Sync from upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Evil0ctal/Douyin_TikTok_Download_API.git
+          git fetch upstream main
+          git merge --no-edit upstream/main
+          git push origin main
