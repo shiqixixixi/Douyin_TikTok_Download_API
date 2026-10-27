@@ -90,6 +90,13 @@ class Capability(StrEnum):
     AUTHOR_MIXES = "author_mixes"
     #: A live room: whether it is broadcasting, and the pull URLs if it is.
     LIVE_ROOM = "live_room"
+    #: The same room, by the broadcast's own id: what an app's share link
+    #: carries, and the ``live_id`` a room answer hands back.
+    LIVE_ROOM_BY_ID = "live_room_by_id"
+    #: Whether each of many broadcasts is on air, by their live_ids.
+    LIVE_STATUS = "live_status"
+    #: A broadcast's audience ranking: who is at the top of the room's list.
+    LIVE_RANKING = "live_ranking"
     #: A board of what people are searching for: words, not posts.
     TRENDING = "trending"
 
@@ -157,6 +164,13 @@ KEYWORD: Final = "keyword"
 #: A live room by what its link carries: Douyin's web_rid, the owner's
 #: @handle on TikTok, Bilibili's room number.
 ROOM_ID: Final = "room_id"
+#: A broadcast by the platform's own id for it: Douyin's and TikTok's
+#: ``room_id``, which ``LiveRoom.live_id`` carries. Not ROOM_ID, which names
+#: the room rather than one broadcast in it - and which, on Douyin, the
+#: platform calls ``web_rid``.
+LIVE_ID: Final = "live_id"
+#: Several of them, comma-separated, for the one call that takes a list.
+LIVE_IDS: Final = "live_ids"
 #: A :class:`dtk.core.types.TrendingBoard` value.
 BOARD: Final = "board"
 
@@ -252,6 +266,8 @@ _ID_PARAMS: Final[frozenset[str]] = frozenset(
         MUSIC_ID,
         HASHTAG_ID,
         ROOM_ID,
+        LIVE_ID,
+        LIVE_IDS,
     }
 )
 
@@ -290,6 +306,9 @@ _ARGUMENTS: Final[Mapping[Platform, Mapping[Capability, Mapping[str, str]]]] = {
         Capability.HASHTAG_DETAIL: {HASHTAG_ID: "ch_id"},
         Capability.AUTHOR_MIXES: {AUTHOR_ID: "sec_user_id", CURSOR: "cursor", COUNT: "count"},
         Capability.LIVE_ROOM: {ROOM_ID: "web_rid"},
+        Capability.LIVE_ROOM_BY_ID: {LIVE_ID: "room_id"},
+        Capability.LIVE_STATUS: {LIVE_IDS: "room_ids"},
+        Capability.LIVE_RANKING: {LIVE_ID: "room_id"},
         Capability.TRENDING: {BOARD: "board"},
     },
     Platform.TIKTOK: {
@@ -333,6 +352,8 @@ _ARGUMENTS: Final[Mapping[Platform, Mapping[Capability, Mapping[str, str]]]] = {
         # A /@handle/live link names the owner, and the owner is how the
         # room is asked for.
         Capability.LIVE_ROOM: {ROOM_ID: "unique_id"},
+        Capability.LIVE_ROOM_BY_ID: {LIVE_ID: "room_id"},
+        Capability.LIVE_STATUS: {LIVE_IDS: "room_ids"},
     },
     # A Bilibili author is a numeric `mid`, the one id it has for a user; a
     # video is a bvid (an `av` number is accepted and converted by the
@@ -423,6 +444,9 @@ _CACHE_TTL_KEYS: Final[Mapping[Capability, str]] = MappingProxyType(
         Capability.AUTHOR_MIXES: "cache.list_ttl",
         # Whether a room is on changes by the minute; the shortest TTL there is.
         Capability.LIVE_ROOM: "cache.list_ttl",
+        Capability.LIVE_ROOM_BY_ID: "cache.list_ttl",
+        Capability.LIVE_STATUS: "cache.list_ttl",
+        Capability.LIVE_RANKING: "cache.list_ttl",
         Capability.TRENDING: "cache.list_ttl",
     }
 )
@@ -656,6 +680,12 @@ class EndpointDefinition:
                 return adapter.parse_live_room(
                     payload, room_id=str(room) if room is not None else None
                 )
+            case Capability.LIVE_ROOM_BY_ID:
+                return adapter.parse_live_room_by_id(payload)
+            case Capability.LIVE_STATUS:
+                return adapter.parse_live_status(payload, live_ids=_listed(canonical.get(LIVE_IDS)))
+            case Capability.LIVE_RANKING:
+                return adapter.parse_live_ranking(payload)
             case Capability.COLLECTION_DETAIL:
                 return adapter.parse_collection_detail(payload)
             case Capability.COMMENTS:
@@ -700,6 +730,16 @@ class ResolvedCall:
 
 def _is_blank(value: Any) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _listed(value: Any) -> tuple[str, ...]:
+    """A comma-separated parameter as its builder sent it upstream: trimmed,
+    blanks and repeats gone, in order. Not checked here - a list the builder
+    refuses fails before there is any payload to parse."""
+    if value is None:
+        return ()
+    parts = (part.strip() for part in str(value).split(","))
+    return tuple(dict.fromkeys(part for part in parts if part))
 
 
 def _as_count(endpoint: str, value: Any) -> int:
@@ -854,6 +894,8 @@ __all__ = [
     "HASHTAG_ID",
     "HASHTAG_NAME",
     "KEYWORD",
+    "LIVE_ID",
+    "LIVE_IDS",
     "MUSIC_ID",
     "OPTIONAL_CAPABILITIES",
     "P0_CAPABILITIES",

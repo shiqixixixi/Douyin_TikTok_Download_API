@@ -6,7 +6,7 @@ Binds the endpoint table to the parsers. Discovered by
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -21,6 +21,8 @@ from dtk.models import (
     ContentPart,
     Hashtag,
     LiveRoom,
+    LiveStatus,
+    LiveViewer,
     Mix,
     MusicDetail,
     Page,
@@ -171,6 +173,21 @@ class TikTokAdapter:
         self, payload: Mapping[str, Any], *, room_id: str | None = None
     ) -> LiveRoom:
         return parser.parse_live_room(payload, room_id=room_id)
+
+    def parse_live_room_by_id(self, payload: Mapping[str, Any]) -> LiveRoom:
+        return parser.parse_live_room_by_id(payload)
+
+    def parse_live_status(
+        self, payload: Mapping[str, Any], *, live_ids: Sequence[str] = ()
+    ) -> Page[LiveStatus]:
+        return parser.parse_live_status(payload, live_ids=live_ids)
+
+    def parse_live_ranking(self, payload: Mapping[str, Any]) -> Page[LiveViewer]:
+        """No call registered: no audience ranking measured here."""
+        raise UnsupportedContent(
+            "TikTok has no live room ranking here",
+            details={"platform": self.platform.value, "capability": "live_ranking"},
+        )
 
     def parse_trending(self, payload: Mapping[str, Any]) -> Page[TrendingTopic]:
         """No board registered: nothing measured answers a guest with one."""

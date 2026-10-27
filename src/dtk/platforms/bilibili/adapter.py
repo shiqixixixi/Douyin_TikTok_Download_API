@@ -6,7 +6,7 @@ Binds the endpoint table to the parsers. Discovered by
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -21,6 +21,8 @@ from dtk.models import (
     ContentPart,
     Hashtag,
     LiveRoom,
+    LiveStatus,
+    LiveViewer,
     Mix,
     MusicDetail,
     Page,
@@ -241,6 +243,29 @@ class BilibiliAdapter:
         self, payload: Mapping[str, Any], *, room_id: str | None = None
     ) -> LiveRoom:
         return parser.parse_live_room(payload, room_id=room_id)
+
+    def parse_live_room_by_id(self, payload: Mapping[str, Any]) -> LiveRoom:
+        """A Bilibili room has one number, and ``parse_live_room`` reads it."""
+        raise UnsupportedContent(
+            "a Bilibili live room has no id apart from its room number",
+            details={"platform": self.platform.value, "capability": "live_room_by_id"},
+        )
+
+    def parse_live_status(
+        self, payload: Mapping[str, Any], *, live_ids: Sequence[str] = ()
+    ) -> Page[LiveStatus]:
+        """No call registered: nothing measured asks about many rooms at once."""
+        raise UnsupportedContent(
+            "Bilibili has no way here to ask about many live rooms at once",
+            details={"platform": self.platform.value, "capability": "live_status"},
+        )
+
+    def parse_live_ranking(self, payload: Mapping[str, Any]) -> Page[LiveViewer]:
+        """No call registered: no audience ranking measured here."""
+        raise UnsupportedContent(
+            "Bilibili has no live room ranking here",
+            details={"platform": self.platform.value, "capability": "live_ranking"},
+        )
 
     def parse_trending(self, payload: Mapping[str, Any]) -> Page[TrendingTopic]:
         return parser.parse_trending(payload)

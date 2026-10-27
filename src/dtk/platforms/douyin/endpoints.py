@@ -29,7 +29,10 @@ from dtk.platforms.douyin.params import (
     comments_params,
     content_detail_params,
     hashtag_detail_params,
+    live_ranking_params,
+    live_room_by_id_params,
     live_room_params,
+    live_status_params,
     mix_posts_params,
     music_detail_params,
     music_posts_params,
@@ -171,6 +174,10 @@ class DouyinAPIEndpoints:
     # Live room info by room id
     LIVE_INFO_ROOM_ID: Final = f"{LIVE_DOMAIN2}/webcast/room/reflow/info/"
 
+    # Whether each of many broadcasts is on air. Lives on the webcast host,
+    # like reflow/info: live.douyin.com answers this path with a 404 (2026-10-26).
+    LIVE_CHECK_ALIVE: Final = f"{LIVE_DOMAIN2}/webcast/room/check_alive/"
+
     # Gift leaderboard of a live room
     LIVE_GIFT_RANK: Final = f"{LIVE_DOMAIN}/webcast/ranklist/audience/"
 
@@ -237,6 +244,9 @@ MUSIC_POSTS: Final = "douyin.music_posts"
 HASHTAG_DETAIL: Final = "douyin.hashtag_detail"
 AUTHOR_MIXES: Final = "douyin.author_mixes"
 LIVE_ROOM: Final = "douyin.live_room"
+LIVE_ROOM_BY_ID: Final = "douyin.live_room_by_id"
+LIVE_STATUS: Final = "douyin.live_status"
+LIVE_RANKING: Final = "douyin.live_ranking"
 TRENDING: Final = "douyin.trending"
 
 #: Sent on every Douyin request. Cookies and User-Agent are injected by the
@@ -446,6 +456,54 @@ ENDPOINTS: Final = EndpointTable.of(
         summary="One live room: whether it is on, and how to play it",
     ),
     EndpointSpec(
+        name=LIVE_ROOM_BY_ID,
+        path=DouyinAPIEndpoints.LIVE_INFO_ROOM_ID,
+        required=("room_id",),
+        build=live_room_by_id_params,
+        risk_weight=1.2,
+        # The live site's headers, the ones it was measured with: the
+        # www.douyin.com Referer is no page of this host's either.
+        headers=(
+            ("Referer", f"{DouyinAPIEndpoints.LIVE_DOMAIN}/"),
+            ("Origin", DouyinAPIEndpoints.LIVE_DOMAIN),
+        ),
+        # Answers a guest with the room, its web_rid, its viewers and its pull
+        # URLs; a room_id nobody has is `status_code: 10011`, "Request params
+        # error" (2026-10-26).
+        summary="One live room, by the broadcast's own id",
+    ),
+    EndpointSpec(
+        name=LIVE_STATUS,
+        path=DouyinAPIEndpoints.LIVE_CHECK_ALIVE,
+        required=("room_ids",),
+        build=live_status_params,
+        risk_weight=1.0,
+        headers=(
+            ("Referer", f"{DouyinAPIEndpoints.LIVE_DOMAIN}/"),
+            ("Origin", DouyinAPIEndpoints.LIVE_DOMAIN),
+        ),
+        # Answers a guest with `{alive, room_id}` for each broadcast that
+        # existed, in the order asked, and leaves out an id that never did
+        # (2026-10-26).
+        summary="Whether each of many broadcasts is on air",
+    ),
+    EndpointSpec(
+        name=LIVE_RANKING,
+        path=DouyinAPIEndpoints.LIVE_GIFT_RANK,
+        required=("room_id",),
+        build=live_ranking_params,
+        risk_weight=1.2,
+        headers=(
+            ("Referer", f"{DouyinAPIEndpoints.LIVE_DOMAIN}/"),
+            ("Origin", DouyinAPIEndpoints.LIVE_DOMAIN),
+        ),
+        # Answers a guest with up to 200 viewers in order, every score 0; a
+        # room_id nobody has is `status_code: 10011` (2026-10-26). Whether a
+        # signed-in account is told the scores was not measured, so a guest
+        # is not marked as getting less.
+        summary="A broadcast's audience ranking",
+    ),
+    EndpointSpec(
         name=TRENDING,
         path=DouyinAPIEndpoints.DOUYIN_HOT_SEARCH,
         required=(),
@@ -488,7 +546,10 @@ __all__ = [
     "DEFAULT_HEADERS",
     "ENDPOINTS",
     "HASHTAG_DETAIL",
+    "LIVE_RANKING",
     "LIVE_ROOM",
+    "LIVE_ROOM_BY_ID",
+    "LIVE_STATUS",
     "MIX_POSTS",
     "MUSIC_DETAIL",
     "MUSIC_POSTS",

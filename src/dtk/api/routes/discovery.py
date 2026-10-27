@@ -50,7 +50,7 @@ from dtk.core.errors import InvalidParam
 from dtk.core.types import Platform, TrendingBoard
 from dtk.platforms import get_adapter
 from dtk.platforms.paging import max_page_size
-from dtk.urls import ResourceKind
+from dtk.urls import ResourceKind, UrlKind
 from dtk.worker import registry
 from dtk.worker.parsing import NAMED_BY_LINK
 
@@ -100,6 +100,25 @@ ROOM_ID_QUERY = Query(
     description=(
         "The room, as an alternative to url: the number in a live.douyin.com or "
         "live.bilibili.com link, or on TikTok the @handle of the account broadcasting."
+    ),
+)
+
+LIVE_ID_QUERY = Query(
+    default=None,
+    min_length=1,
+    max_length=_ID_MAX_LENGTH,
+    description=(
+        "Douyin and TikTok: the broadcast's own id, as an alternative to url and room_id - "
+        "the live_id a room answer carries, or the number in a Douyin app share link."
+    ),
+)
+
+LIVE_IDS_QUERY = Query(
+    min_length=1,
+    # A hundred 19-digit ids and their commas, with room to spare.
+    max_length=2400,
+    description=(
+        "The broadcasts to check, comma-separated: live_id values from /live, up to 100 at a time."
     ),
 )
 
@@ -585,6 +604,7 @@ async def live(
     platform: Platform = PLATFORM_PATH,
     url: str | None = URL_QUERY,
     room_id: str | None = ROOM_ID_QUERY,
+    live_id: str | None = LIVE_ID_QUERY,
     include_raw: bool = RAW_QUERY,
     wait: float | None = WAIT_QUERY,
     proxy: str | None = PROXY_QUERY,
@@ -595,9 +615,12 @@ async def live(
 ) -> Any:
     """One live room: whether it is broadcasting, and how to play it if it is.
 
-    Identify it by **either** `url` **or** `room_id`. A room is addressed the
-    way its link addresses it: Douyin's `live.douyin.com/<web_rid>`, TikTok's
-    `/@<handle>/live`, Bilibili's `live.bilibili.com/<room>`.
+    Identify it by **one** of `url`, `room_id` or `live_id`. A room is
+    addressed the way its link addresses it: Douyin's
+    `live.douyin.com/<web_rid>`, TikTok's `/@<handle>/live`, Bilibili's
+    `live.bilibili.com/<room>`. A Douyin app share link names the broadcast
+    instead, by its own id, and is answered the same way: so is `live_id`,
+    the id a room answer hands back while the room is on.
 
     This reads a room; it does not record one. The pull URLs it returns are
     signed and expire within hours, and they go to a player or a recorder of
@@ -609,6 +632,8 @@ async def live(
     - `url` - a link to the room.
     - `room_id` - the number in a Douyin or Bilibili live link, or the
       TikTok account's @handle.
+    - `live_id` - Douyin and TikTok: the broadcast's own id, a new one each
+      time the room goes on air. Bilibili numbers a room once and has none.
     - `include_raw`, `wait`, `proxy`, `identity`, `refresh`, `explain` - as on
       `/video`. A repeat inside `cache.list_ttl` (5 minutes by default) is
       answered from the cache; pass `refresh` to see whether a room has just
@@ -617,18 +642,53 @@ async def live(
     **Returns**
 
     `room_id`, `is_live`, `title`, `cover`, `web_url`, the broadcaster as
-    `author`, and while the room is live `viewer_count`, `started_at` where
-    the platform states it, and `streams`: one entry per protocol (`flv` or
-    `hls`) and quality, in the platform's own quality names. Bilibili's
-    `viewer_count` is the "watched" figure it prints, not who is in the room
-    now. A room nobody has is `NOT_FOUND`.
+    `author`, and while the room is live `live_id`, `viewer_count`,
+    `started_at` where the platform states it, and `streams`: one entry per
+    protocol (`flv` or `hls`) and quality, in the platform's own quality
+    names. However the room was asked for, `room_id` is what its web link
+    carries. Bilibili's `viewer_count` is the "watched" figure it prints, not
+    who is in the room now. A room nobody has is `NOT_FOUND`.
     """
     authorize(principal, platform)
-    endpoint = supported(platform, Operation.LIVE_ROOM)
-    if not url and not room_id:
-        raise InvalidParam("provide either url or room_id", details={"fields": ["url", "room_id"]})
-    if room_id:
-        room = room_id.strip().lstrip("@").strip()
+    if not url and not room_id and not live_id:
+        raise InvalidParam(
+            "provide one of url, room_id or live_id",
+            details={"fields": ["url", "room_id", "live_id"]},
+        )
+    # An id the caller names wins over a link, as on every other route.
+    kind = vet_url(str(url), expected=platform) if url and not room_id and not live_id else None
+    params: dict[str, Any]
+    if live_id:
+        endpoint = supported(platform, Operation.LIVE_ROOM_BY_ID)
+        params = {"live_id": _numeric_id(live_id, field="live_id"), "url": None}
+    elif kind is not None and kind.resource is ResourceKind.LIVE_ROOM:
+        # A reflow link names the broadcast, and the id is in the link, so it
+        # goes to the endpoint that takes one without a hop.
+        endpoint = supported(platform, Operation.LIVE_ROOM_BY_ID)
+        params = {"live_id": identifier(kind, ResourceKind.LIVE_ROOM), "url": None}
+    else:
+        endpoint = supported(platform, Operation.LIVE_ROOM)
+        params = _live_room_params(platform, kind=kind, room_id=room_id)
+    params["include_raw"] = include_raw
+    return await operations.submit_and_wait(
+        request,
+        principal,
+        endpoint=endpoint,
+        params=params,
+        wait=resolve_wait(request, wait),
+        proxy=await resolve_request_proxy(request, proxy),
+        refresh=refresh,
+        explain=await resolve_explain(request, principal, explain),
+        identity=await resolve_request_identity(request, principal, identity, platform=platform),
+    )
+
+
+def _live_room_params(
+    platform: Platform, *, kind: UrlKind | None, room_id: str | None
+) -> dict[str, Any]:
+    """A room by its link or by what the link carries: ``/live`` as it was."""
+    if room_id or kind is None:
+        room = (room_id or "").strip().lstrip("@").strip()
         if platform not in _ROOMS_BY_HANDLE and not room.isdigit():
             raise InvalidParam(
                 f"a {platform.value} live room is the number in its link",
@@ -636,17 +696,119 @@ async def live(
             )
         if not room:
             raise InvalidParam("room_id is empty", details={"field": "room_id"})
-        params: dict[str, Any] = {"room_id": room, "url": None}
-    else:
-        kind = vet_url(str(url), expected=platform)
-        found = identifier(kind, ResourceKind.LIVE)
-        params = {"room_id": found, "url": None if found else kind.url}
-    params["include_raw"] = include_raw
+        return {"room_id": room, "url": None}
+    found = identifier(kind, ResourceKind.LIVE)
+    return {"room_id": found, "url": None if found else kind.url}
+
+
+@router.get(
+    "/{platform}/live/status",
+    summary="Whether live rooms are on air",
+    openapi_extra={I18N_KEY: "live_status", **ASYNC_RESPONSES},
+)
+async def live_status(
+    request: Request,
+    platform: Platform = PLATFORM_PATH,
+    live_ids: str = LIVE_IDS_QUERY,
+    include_raw: bool = RAW_QUERY,
+    wait: float | None = WAIT_QUERY,
+    proxy: str | None = PROXY_QUERY,
+    identity: str | None = IDENTITY_QUERY,
+    refresh: bool = REFRESH_QUERY,
+    explain: bool = EXPLAIN_QUERY,
+    principal: Principal = Depends(enforce_rate_limit),
+) -> Any:
+    """Whether each of up to 100 broadcasts is still on air, in one call.
+
+    For watching a list of rooms: ask this on a timer, and `/live` for the
+    one that has just come on. It costs one request however many are asked
+    about, where `/live` costs one each.
+
+    **Parameters**
+
+    - `platform` - `douyin` or `tiktok`. Bilibili answers `UNSUPPORTED_CONTENT`.
+    - `live_ids` - the broadcasts, comma-separated: the `live_id` a `/live`
+      answer carries while its room is on. Repeats are asked about once.
+    - `include_raw`, `wait`, `proxy`, `identity`, `refresh`, `explain` - as on
+      `/live`. A repeat inside `cache.list_ttl` (5 minutes by default) is
+      answered from the cache; pass `refresh` for a fresh answer.
+
+    **Returns**
+
+    One page with a `{live_id, is_live}` for each broadcast, in the order
+    asked, so it pairs with the list by position. A broadcast that has ended
+    and an id that was never one are both `is_live: false`.
+    """
+    authorize(principal, platform)
+    endpoint = supported(platform, Operation.LIVE_STATUS)
+    # The builder holds the list to its rules - numbers only, a hundred at
+    # most - and asking it here makes a bad list a 400 rather than a failed
+    # task. Its answer is the list with repeats gone, so two spellings of one
+    # list coalesce on one task.
+    built = get_adapter(platform).endpoints[endpoint].build_params(room_ids=live_ids)
     return await operations.submit_and_wait(
         request,
         principal,
         endpoint=endpoint,
-        params=params,
+        params={"live_ids": built["room_ids"], "include_raw": include_raw},
+        wait=resolve_wait(request, wait),
+        proxy=await resolve_request_proxy(request, proxy),
+        refresh=refresh,
+        explain=await resolve_explain(request, principal, explain),
+        identity=await resolve_request_identity(request, principal, identity, platform=platform),
+    )
+
+
+@router.get(
+    "/{platform}/live/ranking",
+    summary="A live room's audience ranking",
+    openapi_extra={I18N_KEY: "live_ranking", **ASYNC_RESPONSES},
+)
+async def live_ranking(
+    request: Request,
+    platform: Platform = PLATFORM_PATH,
+    live_id: str = Query(
+        min_length=1,
+        max_length=_ID_MAX_LENGTH,
+        description="The broadcast: the live_id a /live answer carries while its room is on.",
+    ),
+    include_raw: bool = RAW_QUERY,
+    wait: float | None = WAIT_QUERY,
+    proxy: str | None = PROXY_QUERY,
+    identity: str | None = IDENTITY_QUERY,
+    refresh: bool = REFRESH_QUERY,
+    explain: bool = EXPLAIN_QUERY,
+    principal: Principal = Depends(enforce_rate_limit),
+) -> Any:
+    """The audience ranking of one broadcast: the list beside the stream.
+
+    Up to 200 viewers, top first, in the order the room's own page lists
+    them. A guest is told the order and not the scores behind it, so none
+    are returned.
+
+    **Parameters**
+
+    - `platform` - `douyin`. TikTok and Bilibili answer `UNSUPPORTED_CONTENT`.
+    - `live_id` - the broadcast: the `live_id` a `/live` answer carries while
+      its room is on air.
+    - `include_raw`, `wait`, `proxy`, `identity`, `refresh`, `explain` - as on
+      `/live`. A repeat inside `cache.list_ttl` (5 minutes by default) is
+      answered from the cache.
+
+    **Returns**
+
+    One page with a `{rank, author}` per place. `author` is null for a
+    viewer who chose not to be listed - the platform still sends their
+    account, and it is not passed on - and for one the platform names to a
+    guest only by a masked nickname. A broadcast nobody has is `NOT_FOUND`.
+    """
+    authorize(principal, platform)
+    endpoint = supported(platform, Operation.LIVE_RANKING)
+    return await operations.submit_and_wait(
+        request,
+        principal,
+        endpoint=endpoint,
+        params={"live_id": _numeric_id(live_id, field="live_id"), "include_raw": include_raw},
         wait=resolve_wait(request, wait),
         proxy=await resolve_request_proxy(request, proxy),
         refresh=refresh,

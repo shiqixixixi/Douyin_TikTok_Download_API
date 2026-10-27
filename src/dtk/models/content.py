@@ -301,6 +301,13 @@ class LiveRoom(_Base):
     #: (the number in a live.douyin.com link), the @handle on TikTok, and
     #: Bilibili's room number.
     room_id: str
+    #: The platform's own id for the broadcast on air, while there is one:
+    #: Douyin's and TikTok's ``room_id``, a new one each time the room goes
+    #: live. It is what an app's share link carries, what ``/live?live_id=``
+    #: and the other live reads take, and why it is not ``room_id`` above -
+    #: that one outlives the broadcast. Bilibili numbers a room once, so has
+    #: none.
+    live_id: str | None = None
     is_live: bool
     title: str | None = None
     cover: Image | None = None
@@ -314,6 +321,32 @@ class LiveRoom(_Base):
     #: Empty when the room is not live.
     streams: list[LiveStream] = Field(default_factory=list)
     raw: dict | None = None
+
+
+class LiveStatus(_Base):
+    """Whether one broadcast is still on air, and nothing else about it.
+
+    The answer to asking about many broadcasts at once: a poller watching a
+    list of rooms asks this, and asks ``/live`` for the one that just came on.
+    """
+
+    platform: Platform
+    #: The broadcast asked about, as ``LiveRoom.live_id`` names it.
+    live_id: str
+    is_live: bool
+
+
+class LiveViewer(_Base):
+    """One place on a live room's audience ranking: the list the room's own
+    page shows beside the stream, top first."""
+
+    platform: Platform
+    #: 1 for the top of the list.
+    rank: int
+    #: None for a viewer the platform does not name: one who chose to hide
+    #: from the list, whom the answer still describes and this does not pass
+    #: on, and one it gives a guest only as a masked nickname with no id.
+    author: Author | None = None
 
 
 class MusicDetail(Music):
@@ -388,7 +421,9 @@ __all__ = [
     "Hashtag",
     "Image",
     "LiveRoom",
+    "LiveStatus",
     "LiveStream",
+    "LiveViewer",
     "Media",
     "Mix",
     "Music",

@@ -29,7 +29,7 @@ generating them needs an identity and, for ``msToken``, a network round trip.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from types import MappingProxyType
@@ -46,6 +46,8 @@ from dtk.models import (
     ContentPart,
     Hashtag,
     LiveRoom,
+    LiveStatus,
+    LiveViewer,
     Mix,
     MusicDetail,
     Page,
@@ -624,6 +626,26 @@ class PlatformAdapter(Protocol):
     ) -> LiveRoom:
         """``room_id`` is the one the request named, for a platform whose
         answer does not repeat it: Douyin's never mentions the web_rid."""
+        ...
+
+    def parse_live_room_by_id(self, payload: Mapping[str, Any]) -> LiveRoom:
+        """The same room, asked for by the broadcast's own id rather than by
+        what its web link carries. A platform without such an id raises
+        ``UnsupportedContent``."""
+        ...
+
+    def parse_live_status(
+        self, payload: Mapping[str, Any], *, live_ids: Sequence[str] = ()
+    ) -> Page[LiveStatus]:
+        """Whether each broadcast asked about is still on air, as one page.
+
+        ``live_ids`` is the list the request named, in its order. The page
+        answers each of them, ``false`` for one the platform's answer leaves
+        out, so a caller can pair its list with the page by position."""
+        ...
+
+    def parse_live_ranking(self, payload: Mapping[str, Any]) -> Page[LiveViewer]:
+        """A broadcast's audience ranking, top first, as one page."""
         ...
 
     def parse_trending(self, payload: Mapping[str, Any]) -> Page[TrendingTopic]: ...

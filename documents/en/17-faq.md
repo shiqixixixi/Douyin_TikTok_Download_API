@@ -148,6 +148,9 @@ project is explicit about it in the import dialog:
   `identity:manage` scope, and writes an audit line — but an administrator of
   your instance can use it.
 - **Use an account kept for this purpose, never your main one.**
+- **A ban is unlikely, not impossible.** Platforms rarely ban an account for
+  reading data with it, but it cannot be ruled out, and a login imported here
+  is used at your own risk.
 
 What the software does to keep any identity out of trouble, guest or not:
 
@@ -220,8 +223,8 @@ What an identity is actually worth is set by the token bucket, which is per
 | Endpoint | Burst | Refill | Sustained, one identity | Sustained, 8 identities |
 | --- | --- | --- | --- | --- |
 | `*.content_detail`, `bilibili.content_streams` | 5 | 0.30/s | 1 per 3.3s | ~2.4/s |
-| `*.author_profile`, `*.related_posts`, `*.music_detail`, `*.hashtag_detail`, `*.live_room`, `*.trending`, `bilibili.live_streams` | 4 | 0.20/s | 1 per 5s | ~1.6/s |
-| `*.comments`, `*.comment_replies`, `*.mix_posts`, `*.author_mixes`, `*.music_posts`, `tiktok.hashtag_posts` | 3 | 0.15/s | 1 per 6.7s | ~1.2/s |
+| `*.author_profile`, `*.related_posts`, `*.music_detail`, `*.hashtag_detail`, `*.live_room`, `*.live_room_by_id`, `*.live_status`, `*.trending`, `bilibili.live_streams` | 4 | 0.20/s | 1 per 5s | ~1.6/s |
+| `*.comments`, `*.comment_replies`, `*.mix_posts`, `*.author_mixes`, `*.music_posts`, `tiktok.hashtag_posts`, `douyin.live_ranking` | 3 | 0.15/s | 1 per 6.7s | ~1.2/s |
 | `douyin.author_posts`, `tiktok.author_posts`, `*.author_likes` | 3 | 0.12/s | 1 per 8.3s | ~1/s |
 | `tiktok.author_followers`, `tiktok.author_following` | 3 | 0.12/s | 1 per 8.3s | ~1/s |
 | `bilibili.author_posts`, `*.search_posts`, `*.search_authors` | 2 | 0.08/s | 1 per 12.5s | ~0.6/s |

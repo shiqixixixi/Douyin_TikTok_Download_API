@@ -226,6 +226,9 @@ illegal** — they are for making friends and talking about the work.
 | The posts under a hashtag | ❌ | ✅ | — |
 | Keyword search: posts and accounts | ❌ | ✅ | ✅ |
 | A live room: whether it is on, and its pull URLs | ✅ | ✅ | ✅ |
+| A live room by its broadcast's own id, and Douyin app share links | ✅ | ✅ | — |
+| Whether many live rooms are on air, in one call | ✅ | ✅ | ❌ |
+| A live room's audience ranking | ✅ | ❌ | ❌ |
 | Trending boards | ✅ | ❌ | ✅ |
 
 Douyin serves its follower and following lists only to a signed-in session, so those
@@ -237,10 +240,13 @@ Importing your own logged-in cookies widens what the rest can see, too.
 On Bilibili that matters most for comments: a guest is shown the three hottest and no
 more, so an imported login is what turns that into the full thread. On Douyin it decides
 an author's liked posts outright: a guest is shown none, public or not, so that list
-needs a logged-in identity in the pool.
+needs a logged-in identity in the pool. An imported login is used at your own risk:
+platforms rarely ban an account for reading data with it, but a ban cannot be ruled out
+([what to know before importing one](documents/en/06-identities-and-proxies.md#a-logged-in-jar-is-not-a-guest-identity)).
 
 The dashes are not gaps: a Douyin or TikTok post is never more than one video, so it has no
-parts to list.
+parts to list, and a Bilibili live room has one number for good rather than an id per
+broadcast.
 
 Media downloads, the content archive, counter snapshots, collections and a watchlist
 are built in; none of them needs another service.

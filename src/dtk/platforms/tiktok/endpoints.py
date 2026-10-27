@@ -33,7 +33,9 @@ from dtk.platforms.tiktok.params import (
     content_detail_params,
     hashtag_detail_params,
     hashtag_posts_params,
+    live_room_by_id_params,
     live_room_params,
+    live_status_params,
     mix_posts_params,
     music_detail_params,
     music_posts_params,
@@ -114,6 +116,11 @@ class TikTokAPIEndpoints:
 
     # A live room by its owner's handle, from the web app's own API host
     LIVE_USER_ROOM: Final = f"{TIKTOK_DOMAIN}/api-live/user/room/"
+    # A live room by the broadcast's own id. The webcast host's, not the web
+    # app's: www.tiktok.com answers this path with a 302 (2026-10-26).
+    LIVE_ROOM_INFO: Final = f"{WEBCAST_DOMAIN}/webcast/room/info/"
+    # Whether each of many broadcasts is on air: one boolean apiece.
+    LIVE_CHECK_ALIVE: Final = f"{WEBCAST_DOMAIN}/webcast/room/check_alive/"
 
     # Keyword search: posts, and accounts
     SEARCH_ITEM: Final = f"{TIKTOK_DOMAIN}/api/search/item/full/"
@@ -156,6 +163,8 @@ SEARCH_POSTS: Final = "tiktok.search_posts"
 SEARCH_AUTHORS: Final = "tiktok.search_authors"
 AUTHOR_MIXES: Final = "tiktok.author_mixes"
 LIVE_ROOM: Final = "tiktok.live_room"
+LIVE_ROOM_BY_ID: Final = "tiktok.live_room_by_id"
+LIVE_STATUS: Final = "tiktok.live_status"
 
 #: Cookies and User-Agent come from the identity; only the platform-specific
 #: referer belongs here.
@@ -436,6 +445,28 @@ ENDPOINTS: Final = EndpointTable.of(
         summary="One live room, by its owner's @handle",
     ),
     EndpointSpec(
+        name=LIVE_ROOM_BY_ID,
+        path=TikTokAPIEndpoints.LIVE_ROOM_INFO,
+        required=("room_id",),
+        build=live_room_by_id_params,
+        risk_weight=1.2,
+        # Answers a guest with the room, its viewers and its pull URLs; a
+        # room_id nobody has is `status_code: 10011`, "Request params error"
+        # (2026-10-26).
+        summary="One live room, by the broadcast's own id",
+    ),
+    EndpointSpec(
+        name=LIVE_STATUS,
+        path=TikTokAPIEndpoints.LIVE_CHECK_ALIVE,
+        required=("room_ids",),
+        build=live_status_params,
+        risk_weight=1.0,
+        # Answers a guest with `{alive, room_id_str}` for every id asked, in
+        # the order asked; an id nobody has is `alive: false`, not an error
+        # (2026-10-26).
+        summary="Whether each of many broadcasts is on air",
+    ),
+    EndpointSpec(
         name=COMMENTS,
         path=TikTokAPIEndpoints.POST_COMMENT,
         required=("aweme_id",),
@@ -474,6 +505,8 @@ __all__ = [
     "HASHTAG_DETAIL",
     "HASHTAG_POSTS",
     "LIVE_ROOM",
+    "LIVE_ROOM_BY_ID",
+    "LIVE_STATUS",
     "MIX_POSTS",
     "MUSIC_DETAIL",
     "MUSIC_POSTS",

@@ -181,6 +181,96 @@ class TestLiveRooms:
         assert built["uniqueId"] == "ventisfit"
         assert built["sourceType"] == "54"
 
+    def test_douyin_asks_the_reflow_page_by_the_broadcast(self) -> None:
+        """The share page's own short list: no browser fields, app 1128."""
+        request = get_adapter("douyin").build_request(
+            "douyin.live_room_by_id", room_id="7300000000000000101"
+        )
+        assert request["url"] == "https://webcast.amemv.com/webcast/room/reflow/info/"
+        assert request["params"] == {
+            "type_id": "0",
+            "live_id": "1",
+            "room_id": "7300000000000000101",
+            "app_id": "1128",
+        }
+        assert request["headers"]["Referer"] == "https://live.douyin.com/"
+
+    def test_tiktok_asks_the_webcast_host_by_the_broadcast(self) -> None:
+        """www.tiktok.com answers /webcast/room/info/ with a 302."""
+        request = get_adapter("tiktok").build_request(
+            "tiktok.live_room_by_id", room_id="7400000000000000101"
+        )
+        assert request["url"] == "https://webcast.tiktok.com/webcast/room/info/"
+        assert request["params"]["room_id"] == "7400000000000000101"
+        assert request["params"]["aid"] == "1988"
+
+    def test_douyin_asks_the_webcast_host_about_many_broadcasts(self) -> None:
+        """live.douyin.com answers /webcast/room/check_alive/ with a 404."""
+        request = get_adapter("douyin").build_request(
+            "douyin.live_status", room_ids=" 7300000000000000101, 7300000000000000102 "
+        )
+        assert request["url"] == "https://webcast.amemv.com/webcast/room/check_alive/"
+        assert request["params"]["room_ids"] == "7300000000000000101,7300000000000000102"
+        assert request["params"]["app_name"] == "douyin_web"
+        assert request["headers"]["Referer"] == "https://live.douyin.com/"
+
+    def test_tiktok_asks_the_webcast_host_about_many_broadcasts(self) -> None:
+        request = get_adapter("tiktok").build_request(
+            "tiktok.live_status", room_ids=" 7400000000000000101, 7400000000000000102 "
+        )
+        assert request["url"] == "https://webcast.tiktok.com/webcast/room/check_alive/"
+        assert request["params"]["room_ids"] == "7400000000000000101,7400000000000000102"
+
+    @pytest.mark.parametrize("endpoint", ["douyin.live_status", "tiktok.live_status"])
+    def test_a_broadcast_named_twice_is_asked_about_once(self, endpoint: str) -> None:
+        built = query(endpoint, room_ids="7400000000000000101,7400000000000000101")
+        assert built["room_ids"] == "7400000000000000101"
+
+    @pytest.mark.parametrize("endpoint", ["douyin.live_status", "tiktok.live_status"])
+    @pytest.mark.parametrize(
+        "room_ids",
+        [
+            "",
+            " , ",
+            "7400000000000000101,ventisfit",
+            ",".join(str(7400000000000000000 + n) for n in range(101)),
+        ],
+    )
+    def test_a_list_that_cannot_be_asked_about_is_refused(
+        self, endpoint: str, room_ids: str
+    ) -> None:
+        with pytest.raises(InvalidParam):
+            query(endpoint, room_ids=room_ids)
+
+    @pytest.mark.parametrize("endpoint", ["douyin.live_status", "tiktok.live_status"])
+    def test_a_hundred_broadcasts_is_one_call(self, endpoint: str) -> None:
+        many = ",".join(str(7400000000000000000 + n) for n in range(100))
+        assert query(endpoint, room_ids=many)["room_ids"] == many
+
+    def test_douyin_asks_the_live_site_for_the_audience_list(self) -> None:
+        request = get_adapter("douyin").build_request(
+            "douyin.live_ranking", room_id="7300000000000000101"
+        )
+        assert request["url"] == "https://live.douyin.com/webcast/ranklist/audience/"
+        built = request["params"]
+        assert built["room_id"] == "7300000000000000101"
+        assert built["rank_type"] == "30"
+        # Without it the list stops at 100.
+        assert built["webcast_sdk_version"] == "2450"
+        assert built["app_name"] == "douyin_web"
+        assert "web_rid" not in built
+        assert request["headers"]["Referer"] == "https://live.douyin.com/"
+
+    def test_a_ranking_is_asked_for_by_a_number(self) -> None:
+        with pytest.raises(InvalidParam):
+            query("douyin.live_ranking", room_id="abc")
+
+    @pytest.mark.parametrize("endpoint", ["douyin.live_room_by_id", "tiktok.live_room_by_id"])
+    def test_a_broadcast_is_a_number(self, endpoint: str) -> None:
+        with pytest.raises(InvalidParam) as caught:
+            query(endpoint, room_id="ventisfit")
+        assert caught.value.details["field"] == "live_id"
+
     def test_bilibili_follows_a_live_room_with_its_play_info(self) -> None:
         request = get_adapter("bilibili").build_request("bilibili.live_streams", room_id="173551")
         assert request["params"]["room_id"] == "173551"

@@ -93,6 +93,9 @@ class Operation(StrEnum):
     SEARCH_AUTHORS = "search_authors"
     AUTHOR_MIXES = "author_mixes"
     LIVE_ROOM = "live_room"
+    LIVE_ROOM_BY_ID = "live_room_by_id"
+    LIVE_STATUS = "live_status"
+    LIVE_RANKING = "live_ranking"
     TRENDING = "trending"
 
 

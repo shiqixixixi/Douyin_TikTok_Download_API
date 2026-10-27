@@ -8,7 +8,7 @@ platform is added.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -23,6 +23,8 @@ from dtk.models import (
     ContentPart,
     Hashtag,
     LiveRoom,
+    LiveStatus,
+    LiveViewer,
     Mix,
     MusicDetail,
     Page,
@@ -227,6 +229,17 @@ class DouyinAdapter:
         self, payload: Mapping[str, Any], *, room_id: str | None = None
     ) -> LiveRoom:
         return parser.parse_live_room(payload, room_id=room_id)
+
+    def parse_live_room_by_id(self, payload: Mapping[str, Any]) -> LiveRoom:
+        return parser.parse_live_room_by_id(payload)
+
+    def parse_live_status(
+        self, payload: Mapping[str, Any], *, live_ids: Sequence[str] = ()
+    ) -> Page[LiveStatus]:
+        return parser.parse_live_status(payload, live_ids=live_ids)
+
+    def parse_live_ranking(self, payload: Mapping[str, Any]) -> Page[LiveViewer]:
+        return parser.parse_live_ranking(payload)
 
     def parse_trending(self, payload: Mapping[str, Any]) -> Page[TrendingTopic]:
         return parser.parse_trending(payload)

@@ -336,13 +336,14 @@
       "submit": "Store identity",
       "stored": "Identity imported.",
       "failed": "Import failed",
-      "acknowledge": "I understand this cookie set is equivalent to the account password.",
+      "acknowledge": "I understand this cookie set is equivalent to the account password, and that the account could be banned; I use it at my own risk.",
       "expiryNotice": "This session is expected to expire on {date}. A notification goes out before it does.",
       "risk": {
         "title": "This is a credential",
         "equivalence": "A logged-in cookie set is equivalent to the account password: whoever holds it can act as that account.",
         "storage": "It is stored encrypted and no endpoint ever returns it, but an administrator of this instance can use it.",
-        "dedicated": "Use an account kept for this purpose, never your main one."
+        "dedicated": "Use an account kept for this purpose, never your main one.",
+        "ban": "Platforms rarely ban an account for reading data with it, but a ban cannot be ruled out. Importing a login, and using what it is imported for, is at your own risk."
       },
       "format": "Format",
       "browser": "Browser",
@@ -1495,6 +1496,8 @@
       "searchPosts": "Search posts",
       "searchUsers": "Search accounts",
       "live": "Live room",
+      "liveRanking": "Live room audience ranking",
+      "liveStatus": "Whether live rooms are on air",
       "trending": "Trending board"
     },
     "endpointLabel": "Endpoint",
@@ -1574,6 +1577,9 @@
       "keyword": "What to search for, as you would type it into the platform's search box.",
       "liveUrl": "A link to the live room.",
       "room_id": "The number in the live room's link. Provide this or a link.",
+      "live_id": "The broadcast's own id: the live_id a room answer carries, or the number in a Douyin app share link. Provide this, a room or a link.",
+      "live_ids": "The broadcasts to check, comma-separated: the live_id each room answer carries, up to 100.",
+      "rankingLiveId": "The broadcast: the live_id a live room answer carries while the room is on.",
       "trendingBoard": "Which board: hot (the default), entertainment, society or challenge. Bilibili has hot only."
     },
     "paramFor": {

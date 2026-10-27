@@ -600,6 +600,10 @@ without reading.
   holds it can act as that account. It is stored encrypted and no endpoint
   returns it, but an administrator of this instance can use it.
 - **Use an account kept for this purpose, never your main one.**
+- **The account could be banned.** Platforms rarely ban an account for reading
+  data with it, but a ban cannot be ruled out. You import a login, and use the
+  features that need one, at your own risk; the checkbox is where the dialog
+  asks you to accept that.
 - The pool is instance-wide and its rows have no owner. Naming an identity in a
   request (`?identity=<uuid>`) is therefore gated on the operator role and the
   `admin` or `identity:manage` scope - a plain read key must not be able to
@@ -730,9 +734,11 @@ single posts, profiles, and comments and their pages; all of TikTok but its
 search; and on Bilibili everything but the comment list and a comment's replies
 past their first page - a guest is served the first page of replies, up to 20,
 and nothing after it, so later pages of replies need a login just as comments
-do. Sounds, hashtags, mixes, live rooms, related posts and trending boards, and
+do. Sounds, hashtags, mixes, live rooms - by link, by broadcast, many at once,
+and a Douyin room's audience ranking - related posts and trending boards, and
 Bilibili's search, were measured with guests only: a guest got a full answer,
-so they are treated the same way.
+so they are treated the same way. The one thing a guest was not told is the
+score beside each place on that ranking, and no score is returned to anyone.
 
 Those endpoints are answered by **guests first**, `pool.<platform>.guests_first`,
 on by default and set per platform. A guest is minted for nothing and replaced
@@ -1225,9 +1231,10 @@ refill lazily from elapsed time and idle ones expire after 24 hours.
 | --- | --- | --- | --- |
 | `douyin.content_detail`, `tiktok.content_detail` | 5 | 0.30 | 1.0 |
 | `douyin.author_profile`, `tiktok.author_profile` | 4 | 0.20 | 1.2 |
-| `douyin.related_posts`, `douyin.live_room` and the TikTok equivalents | 4 | 0.20 | 1.2 |
-| `douyin.music_detail`, `douyin.hashtag_detail`, `douyin.trending` and TikTok's sound and hashtag detail | 4 | 0.20 | 1.0 |
+| `douyin.related_posts`, `douyin.live_room`, `douyin.live_room_by_id` and the TikTok equivalents | 4 | 0.20 | 1.2 |
+| `douyin.music_detail`, `douyin.hashtag_detail`, `douyin.live_status`, `douyin.trending` and the TikTok equivalents | 4 | 0.20 | 1.0 |
 | `douyin.comments`, `douyin.comment_replies`, `douyin.mix_posts`, `douyin.author_mixes`, `douyin.music_posts`, the TikTok equivalents and `tiktok.hashtag_posts` | 3 | 0.15 | 1.5 |
+| `douyin.live_ranking` | 3 | 0.15 | 1.2 |
 | `douyin.author_posts`, `douyin.author_likes` and the TikTok equivalents | 3 | 0.12 | 1.8 |
 | `tiktok.author_followers`, `tiktok.author_following` | 3 | 0.12 | 1.8 |
 | `tiktok.search_posts`, `tiktok.search_authors` | 2 | 0.08 | 1.8 |

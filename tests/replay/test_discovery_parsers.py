@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from dtk.core.errors import UpstreamChanged
+from dtk.core.errors import UnsupportedContent, UpstreamChanged
 from dtk.core.types import ContentKind, Platform
 from dtk.platforms import get_adapter
 from dtk.worker import registry
@@ -621,6 +621,222 @@ def test_a_tiktok_room_that_has_ended() -> None:
     assert room.is_live is False
     assert room.streams == []
     assert room.started_at is None
+
+
+def test_a_room_that_is_on_says_which_broadcast_it_is() -> None:
+    """``live_id`` is what ``/live?live_id=`` and the other live reads take,
+    so the answer that found a room has to hand it back."""
+    douyin = get_adapter("douyin").parse_live_room(
+        load("douyin", "live_room_on"), room_id="615171448842"
+    )
+    tiktok = get_adapter("tiktok").parse_live_room(load("tiktok", "live_room_on"))
+    assert douyin.live_id == "7300000000000000101"
+    # The user's roomId: nothing under liveRoom carries it.
+    assert tiktok.live_id == "7400000000000000101"
+
+
+def test_a_room_that_has_ended_has_no_broadcast_to_name() -> None:
+    for platform in ("douyin", "tiktok"):
+        room = get_adapter(platform).parse_live_room(load(platform, "live_room_off"), room_id="1")
+        assert room.live_id is None, platform
+    assert get_adapter("bilibili").parse_live_room(bilibili_live_on()).live_id is None
+
+
+def test_a_douyin_room_by_its_broadcast_is_named_by_its_web_rid() -> None:
+    """The reflow answer carries the room's web_rid as ``owner.web_rid``,
+    which is what the room is asked for by again once this broadcast ends."""
+    room = get_adapter("douyin").parse_live_room_by_id(load("douyin", "live_room_by_id_on"))
+
+    assert room.platform is Platform.DOUYIN
+    assert room.room_id == "615171448842"
+    assert room.web_url == "https://live.douyin.com/615171448842"
+    assert room.live_id == "7300000000000000101"
+    assert room.is_live is True
+    assert room.title == "Synthetic live title"
+    # user_count: room_view_stats here counts who has watched, 348,959.
+    assert room.viewer_count == 16109
+    assert room.like_count == 101481
+    # The broadcaster is room.owner; data.user is the guest that asked.
+    assert room.author is not None
+    assert room.author.sec_uid == "MS4wLjABAAAA_SYNTHETIC_DOUYIN_AUTHOR_0001"
+    assert room.author.unique_id == "synthetic.creator"
+    assert {(s.format, s.quality) for s in room.streams} == {
+        (fmt, quality) for fmt in ("flv", "hls") for quality in ("FULL_HD1", "HD1", "SD1", "SD2")
+    }
+
+
+def test_a_douyin_broadcast_without_its_web_rid_is_named_by_itself() -> None:
+    payload = load("douyin", "live_room_by_id_on")
+    del payload["data"]["room"]["owner"]["web_rid"]
+    room = get_adapter("douyin").parse_live_room_by_id(payload)
+    assert room.room_id == "7300000000000000101"
+    assert room.web_url is None
+
+
+def test_a_tiktok_room_by_its_broadcast_is_named_by_its_owner() -> None:
+    room = get_adapter("tiktok").parse_live_room_by_id(load("tiktok", "live_room_by_id_on"))
+
+    assert room.platform is Platform.TIKTOK
+    assert room.room_id == "synthetic.creator"
+    assert room.web_url == "https://www.tiktok.com/@synthetic.creator/live"
+    assert room.live_id == "7400000000000000101"
+    assert room.is_live is True
+    assert room.viewer_count == 249
+    # create_time: start_time beside it is 0, and create_time is what the
+    # handle answer calls startTime.
+    assert room.started_at is not None
+    assert int(room.started_at.timestamp()) == 1792537200
+    assert room.like_count is None
+    assert room.author is not None
+    assert room.author.uid == "1000000000000000001"
+    assert room.author.sec_uid == "MS4wLjABAAAA_SYNTHETIC_TIKTOK_AUTHOR_0001"
+    assert room.author.unique_id == "synthetic.creator"
+    # The same JSON-in-a-string as the handle answer, under another key.
+    pairs = {(s.format, s.quality) for s in room.streams}
+    assert pairs == {("flv", "hd"), ("hls", "hd"), ("flv", "ao")}
+
+
+def test_a_broadcast_that_has_ended_has_no_streams() -> None:
+    douyin = load("douyin", "live_room_by_id_on")
+    douyin["data"]["room"]["status"] = 4
+    tiktok = load("tiktok", "live_room_by_id_on")
+    tiktok["data"]["status"] = 4
+    for platform, payload in (("douyin", douyin), ("tiktok", tiktok)):
+        room = get_adapter(platform).parse_live_room_by_id(payload)
+        assert room.is_live is False, platform
+        assert room.live_id is None, platform
+        assert room.streams == [], platform
+        assert room.viewer_count is None, platform
+
+
+def test_douyin_and_tiktok_answer_for_each_broadcast_in_the_order_asked() -> None:
+    douyin = get_adapter("douyin").parse_live_status(load("douyin", "live_status"))
+    assert [(s.live_id, s.is_live) for s in douyin.items] == [
+        ("7300000000000000101", True),
+        ("7300000000000000102", False),
+        ("7300000000000000103", False),
+    ]
+    assert all(s.platform is Platform.DOUYIN for s in douyin.items)
+    assert douyin.has_more is False
+    assert douyin.cursor is None
+
+    tiktok = get_adapter("tiktok").parse_live_status(load("tiktok", "live_status"))
+    assert [(s.live_id, s.is_live) for s in tiktok.items] == [
+        ("7400000000000000101", True),
+        ("7400000000000000102", True),
+        ("7400000000000000103", False),
+    ]
+    assert all(s.platform is Platform.TIKTOK for s in tiktok.items)
+    assert tiktok.has_more is False
+    assert tiktok.cursor is None
+
+
+@pytest.mark.parametrize("platform", ["douyin", "tiktok"])
+def test_an_id_left_out_of_the_answer_is_off_air_in_its_own_place(platform: str) -> None:
+    # Douyin leaves out an id that was never a broadcast. Before it was put
+    # back the page came up one short, and a caller pairing it with its list
+    # by position gave every room after the gap its neighbour's answer.
+    adapter = get_adapter(platform)
+    payload = load(platform, "live_status")
+    full = [(s.live_id, s.is_live) for s in adapter.parse_live_status(payload).items]
+    asked = tuple(live_id for live_id, _ in full)
+    del payload["data"][0]  # on air in both fixtures, so a shift would show
+
+    page = adapter.parse_live_status(payload, live_ids=asked)
+
+    assert [(s.live_id, s.is_live) for s in page.items] == [(asked[0], False), *full[1:]]
+
+
+def test_douyin_answers_an_ask_of_only_nonexistent_broadcasts_off_air() -> None:
+    payload = load("douyin", "live_status")
+    payload["data"] = []
+    asked = ("7300000000000000901", "7300000000000000902")
+    page = get_adapter("douyin").parse_live_status(payload, live_ids=asked)
+    assert [(s.live_id, s.is_live) for s in page.items] == [(a, False) for a in asked]
+    assert page.has_more is False
+    assert page.cursor is None
+
+
+def test_a_status_task_is_answered_for_its_list_as_the_request_sent_it() -> None:
+    payload = load("douyin", "live_status")
+    del payload["data"][0]
+    page = registry.definition_for("douyin.live_status").parse(
+        payload,
+        params={"live_ids": " 7300000000000000101, 7300000000000000102,,7300000000000000101"},
+    )
+    assert [(s.live_id, s.is_live) for s in page.items] == [
+        ("7300000000000000101", False),
+        ("7300000000000000102", False),
+    ]
+
+
+@pytest.mark.parametrize("platform", ["douyin", "tiktok"])
+def test_a_status_without_its_flag_is_a_changed_answer_not_an_ended_room(platform: str) -> None:
+    payload = load(platform, "live_status")
+    del payload["data"][0]["alive"]
+    with pytest.raises(UpstreamChanged):
+        get_adapter(platform).parse_live_status(payload)
+
+
+def test_bilibili_has_no_way_to_check_many_rooms() -> None:
+    with pytest.raises(UnsupportedContent):
+        get_adapter("bilibili").parse_live_status({})
+
+
+def test_a_douyin_ranking_is_its_places_in_order() -> None:
+    page = get_adapter("douyin").parse_live_ranking(load("douyin", "live_ranking"))
+
+    assert [viewer.rank for viewer in page.items] == [1, 2, 3, 4]
+    first = page.items[0].author
+    assert first is not None
+    assert first.sec_uid == "MS4wLjABAAAA_SYNTHETIC_DOUYIN_VIEWER_0001"
+    assert first.unique_id == "synthetic.viewer.a"
+    assert first.web_url == (
+        "https://www.douyin.com/user/MS4wLjABAAAA_SYNTHETIC_DOUYIN_VIEWER_0001"
+    )
+    assert page.has_more is False
+
+
+def test_a_viewer_who_chose_not_to_be_listed_is_a_place_without_a_name() -> None:
+    """The answer still carries their account; it is not passed on."""
+    payload = load("douyin", "live_ranking")
+    assert payload["data"]["ranks"][1]["user"]["sec_uid"]
+    page = get_adapter("douyin").parse_live_ranking(payload)
+    assert page.items[1].rank == 2
+    assert page.items[1].author is None
+    dumped = page.model_dump_json()
+    assert "VIEWER_0002" not in dumped
+    assert "synthetic.viewer.b" not in dumped
+
+
+def test_a_viewer_named_only_by_a_mask_is_nobody_to_ask_about() -> None:
+    page = get_adapter("douyin").parse_live_ranking(load("douyin", "live_ranking"))
+    assert page.items[3].rank == 4
+    assert page.items[3].author is None
+
+
+def test_a_ranking_place_that_is_not_one_is_a_changed_answer() -> None:
+    payload = load("douyin", "live_ranking")
+    payload["data"]["ranks"][0]["rank"] = 0
+    with pytest.raises(UpstreamChanged):
+        get_adapter("douyin").parse_live_ranking(payload)
+
+
+def test_an_empty_room_is_an_empty_ranking() -> None:
+    payload = load("douyin", "live_ranking")
+    payload["data"]["ranks"] = []
+    assert get_adapter("douyin").parse_live_ranking(payload).items == []
+
+
+@pytest.mark.parametrize("platform", ["tiktok", "bilibili"])
+def test_only_douyin_ranks_a_room(platform: str) -> None:
+    with pytest.raises(UnsupportedContent):
+        get_adapter(platform).parse_live_ranking({})
+
+
+def test_bilibili_has_no_broadcast_id_to_ask_by() -> None:
+    with pytest.raises(UnsupportedContent):
+        get_adapter("bilibili").parse_live_room_by_id({})
 
 
 def test_a_bilibili_room_that_is_live_is_followed_by_its_pull_urls() -> None:
