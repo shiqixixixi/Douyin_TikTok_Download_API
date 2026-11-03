@@ -41,6 +41,12 @@ class BootstrapSettings(BaseSettings):
 
     secret_key: str = Field(default="", description="Master key for credential encryption")
     database_url: str = Field(default="postgresql+asyncpg://dtk:dtk@postgres:5432/dtk")
+    #: Connections each process keeps open, and how many more it may open under
+    #: load before a request waits for one instead. The api and the worker each
+    #: get this many; the diagnosis warns when the two together, plus room for
+    #: the CLI and TimescaleDB, exceed Postgres' `max_connections`.
+    db_pool_size: int = Field(default=5, ge=1)
+    db_max_overflow: int = Field(default=5, ge=0)
     redis_url: str = Field(default="redis://redis:6379/0")
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000
@@ -182,6 +188,20 @@ def _pool_override(value: Any) -> int:
     number = int(value)
     if number < -1:
         raise ValueError("must be -1 (use the global value) or a count of 0 or more")
+    return number
+
+
+def _retire_streak(value: Any) -> int:
+    """0 (never) or a streak of at least two.
+
+    One would retire a guest for a single bad answer - a proxy that dropped
+    once, a request the platform happened to throttle - which is what the
+    cooldown is for. The maintenance job also never retires below
+    ``pool.max_fail_streak``, so a value under it acts as that.
+    """
+    number = int(value)
+    if number < 0 or number == 1:
+        raise ValueError("must be 0 (never) or a streak of 2 or more")
     return number
 
 
@@ -339,6 +359,15 @@ RUNTIME_SETTINGS: dict[str, SettingSpec] = {
             int,
             "Consecutive failures after which an identity stops counting towards "
             "the pool level, so the filler replaces it instead of counting it",
+        ),
+        SettingSpec(
+            "pool.retire_fail_streak",
+            10,
+            Scope.RUNTIME,
+            int,
+            "Consecutive failures after which a minted guest identity is retired "
+            "automatically, while its platform still has a usable one; 0 never retires",
+            validate=_retire_streak,
         ),
         *_pool_platform_settings(),
         *_pool_login_settings(),

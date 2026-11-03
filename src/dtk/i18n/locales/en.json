@@ -93,6 +93,7 @@
         "min_size": "Low-water mark per platform. Dropping below it raises an alert and triggers minting.",
         "health_prior": "Assumed success rate for an identity with no history yet, between 0 and 1. It decides how eagerly a freshly minted identity is scheduled.",
         "max_fail_streak": "Consecutive failures after which an identity stops counting towards the pool level, so the filler mints a replacement instead of counting a session that serves nothing. The failure streak is used rather than the health score because the score is empty until there is traffic, and scoring a freshly minted identity as unusable would turn the low-water mark into a minting loop.",
+        "retire_fail_streak": "Consecutive failures after which a minted guest identity is retired on its own, its cookies wiped. Only while the platform still has an identity under pool.max_fail_streak - when every identity is failing, the platform is refusing everyone and none is retired. Imported identities, logins above all, are never retired automatically. Never below pool.max_fail_streak. 0 turns it off. Checked every five minutes.",
         "douyin": {
           "min_size": "Mint-below mark for Douyin only. -1 follows pool.min_size; 0 turns automatic minting off for Douyin, together with its pool_empty and pool_below_min alerts. Identities you import or mint by hand still work.",
           "target_size": "Top-up target for Douyin only. -1 follows pool.target_size. Values below this platform's mint-below mark are raised to it.",
@@ -1044,6 +1045,7 @@
       "components_unreachable": "unreachable: {components}",
       "components_browser_rpc_down": "postgres and redis are reachable; browser-rpc is not ({detail})",
       "components_sidecar_down": "postgres and redis are reachable; configured but not answering: {components}",
+      "components_db_connections": "Under load the api and the worker can open {budget} database connections; Postgres accepts {max_connections}",
       "components_ok": "all components reachable",
       "egress_unreachable": "no platform domain could be reached directly",
       "egress_partial": "{reachable} of {total} platform domains reachable",
@@ -1073,6 +1075,7 @@
       "components_unreachable": "Check that the postgres and redis containers are running and that DTK_DATABASE_URL and DTK_REDIS_URL point at them.",
       "components_browser_rpc_down": "Minting and the signing fallback are unavailable. Start the browser container, or import cookies manually and stay on the native signer.",
       "components_sidecar_down": "Media downloads or transcription fail until the container answers. Start its compose profile, or unset DTK_DOWNLOADER_URL or DTK_TRANSCRIBER_URL if it is not meant to run here.",
+      "components_db_connections": "Requests start failing with \"too many clients already\" once traffic fills the pools. Lower DTK_DB_POOL_SIZE and DTK_DB_MAX_OVERFLOW in .env, or raise Postgres' max_connections - docker/compose.yml sets it on the postgres command line - and restart.",
       "egress_unreachable": "This machine has no usable route to the platforms. Check DNS, the host firewall, and whether outbound traffic needs a proxy.",
       "egress_partial": "Requests for the unreachable platform will depend entirely on a working proxy.",
       "proxies_none": "Every identity will share this machine's egress IP. That is fine for a first look and a correlation risk for a busy pool.",
