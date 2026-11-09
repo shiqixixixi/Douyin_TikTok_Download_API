@@ -29,7 +29,7 @@ from datetime import datetime
 from typing import Any, Final
 from urllib.parse import quote
 
-from dtk.core.errors import UpstreamRiskControl
+from dtk.core.errors import MediaWithheld, UpstreamRiskControl
 from dtk.core.types import ContentKind, Platform
 from dtk.models import (
     AlbumImage,
@@ -63,6 +63,7 @@ from dtk.platforms.common import (
     seconds_to_ms,
     split_title,
 )
+from dtk.platforms.tiktok.params import SEARCH_CURSOR
 
 _PLATFORM: Final = Platform.TIKTOK
 _NAME: Final = _PLATFORM.value
@@ -382,11 +383,11 @@ def _tags(item: Node) -> list[str]:
     return tags
 
 
-def content_from_node(item: Node, *, fetched_at: datetime) -> Content:
+def content_from_node(item: Node, *, fetched_at: datetime, media_optional: bool = False) -> Content:
     """Build a :class:`Content` from one ``itemStruct``.
 
     Shared by the detail endpoint and the post list, which return identical
-    objects.
+    objects. ``media_optional`` is for the lists, through :func:`_page_items`.
     """
     content_id = item.id("id")
     title, description = split_title(item.text("desc"))
@@ -411,7 +412,16 @@ def content_from_node(item: Node, *, fetched_at: datetime) -> Content:
 
     video = item.opt_child("video")
     # A taken-down or private post keeps its metadata but drops its media URLs.
-    media = _media(item, kind, video, image_post, require_media=not (is_deleted or is_private))
+    expect_media = not (media_optional or is_deleted or is_private)
+    if expect_media and _shop_video(item):
+        media = _media(item, kind, video, image_post, require_media=False)
+        if not (media.video or media.images):
+            raise MediaWithheld(
+                "TikTok's web API does not hand out the media of a TikTok Shop video",
+                details={"content_id": content_id, "reason": "shop_video"},
+            )
+    else:
+        media = _media(item, kind, video, image_post, require_media=expect_media)
 
     duration_ms = None
     if kind is ContentKind.VIDEO and video is not None:
@@ -498,10 +508,52 @@ def parse_author_list(payload: Mapping[str, Any]) -> Page[Author]:
     return Page(items=items, cursor=cursor, has_more=has_more)
 
 
+def _has_media(content: Content) -> bool:
+    return content.media.video is not None or bool(content.media.images)
+
+
+def _shop_video(item: Node) -> bool:
+    """A TikTok Shop video, which the web API sends without its media."""
+    return bool(optional_int(item.get("isECVideo")))
+
+
+def _page_items(nodes: Sequence[Node], *, fetched_at: datetime) -> list[Content]:
+    """The posts of one list page, where one post's missing media is not fatal.
+
+    TikTok sends some posts with ``playAddr: ""`` and nothing beside it - no
+    ``downloadAddr``, no ``bitrateInfo`` - among posts that have all three.
+    Parsed strictly, as the detail endpoint parses, the first such post failed
+    the page: HTTP 502, UPSTREAM_CHANGED asking for a report, and every other
+    post gone with it (#819, for an author's posts and for a search). Such a
+    post now comes back with its metadata and no streams.
+
+    Which posts: measured 2026-11-08 on the account in #819, six of eight came
+    bare to a guest, every one of them ``isECVideo: 1``, and the two that were
+    not shop videos had all their streams. A signed-in account was sent the
+    same shop videos just as bare, here and on the detail endpoint, where such
+    a post is MEDIA_WITHHELD rather than a half-filled model.
+
+    A page on which no post has media is still a schema change - a renamed
+    field empties every post, not some - and raises the error the first post
+    would have raised alone. Posts that never carry media are not counted
+    either way: taken down, private, or a shop video, so that a seller's page
+    of nothing but shop videos is not read as one.
+    """
+    items = [content_from_node(node, fetched_at=fetched_at, media_optional=True) for node in nodes]
+    expected = [
+        node
+        for node, content in zip(nodes, items, strict=True)
+        if not (content.is_deleted or content.is_private or _shop_video(node))
+    ]
+    if expected and not any(_has_media(content) for content in items):
+        content_from_node(expected[0], fetched_at=fetched_at)
+    return items
+
+
 def parse_author_posts(payload: Mapping[str, Any], *, fetched_at: datetime) -> Page[Content]:
     """Parse ``/api/post/item_list/``."""
     root = _guard(payload)
-    items = [content_from_node(item, fetched_at=fetched_at) for item in root.children("itemList")]
+    items = _page_items(root.children("itemList"), fetched_at=fetched_at)
     has_more = optional_bool(root.present("hasMore"))
     cursor = optional_id(root.get("cursor")) if has_more else None
     if has_more and cursor is None:
@@ -512,7 +564,7 @@ def parse_author_posts(payload: Mapping[str, Any], *, fetched_at: datetime) -> P
 def parse_related_posts(payload: Mapping[str, Any], *, fetched_at: datetime) -> Page[Content]:
     """Parse ``/api/related/item_list/``: one batch, with ``cursor: -1``."""
     root = _guard(payload)
-    items = [content_from_node(item, fetched_at=fetched_at) for item in root.children("itemList")]
+    items = _page_items(root.children("itemList"), fetched_at=fetched_at)
     return Page(items=items, cursor=None, has_more=False)
 
 
@@ -614,15 +666,25 @@ def parse_search_posts(payload: Mapping[str, Any], *, fetched_at: datetime) -> P
     The items are ordinary ``itemStruct`` objects; the envelope is snake_case
     - ``item_list``, ``has_more`` as 0 or 1, a numeric ``cursor`` - and drops
     ``item_list`` altogether on a page with nothing in it.
+
+    The cursor handed out is ``<offset>:<log_pb.impr_id>``: the next page is
+    only answered to a request naming the search it continues, see
+    :func:`~dtk.platforms.tiktok.params.search_posts_params`. An id that could
+    not be sent back as it stands is left off, and the offset goes alone.
     """
     root = _guard(payload)
-    items = [
-        content_from_node(item, fetched_at=fetched_at) for item in root.listed_children("item_list")
-    ]
+    items = _page_items(root.listed_children("item_list"), fetched_at=fetched_at)
     has_more = optional_bool(root.get("has_more")) and bool(items)
-    cursor = optional_id(root.get("cursor")) if has_more else None
-    if has_more and cursor is None:
+    offset = optional_id(root.get("cursor")) if has_more else None
+    if has_more and offset is None:
         raise root.missing("cursor")
+    cursor = offset
+    log_pb = root.opt_child("log_pb")
+    search_id = optional_str(log_pb.get("impr_id")) if log_pb is not None else None
+    if offset is not None and search_id is not None:
+        candidate = f"{offset}:{search_id}"
+        if SEARCH_CURSOR.fullmatch(candidate):
+            cursor = candidate
     return Page(items=items, cursor=cursor, has_more=has_more)
 
 
