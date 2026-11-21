@@ -22,6 +22,8 @@ import { CopyableId } from './CopyableId'
 import { DataTable, type Column } from './DataTable'
 import { Drawer } from './Drawer'
 import { ErrorState } from './ErrorState'
+import { InfoIcon } from './Icons'
+import { Banner } from './SettingEditor'
 import { ErrorCodeBadge, StatusBadge } from './StatusBadge'
 import { Textarea } from './Textarea'
 import { useToast } from './Toast'
@@ -82,11 +84,23 @@ interface AlbumImage extends MediaImage {
   video?: VideoStream | null
 }
 
+/**
+ * What fetching the links directly takes, as the parser measured it per
+ * platform (`dtk.models.content.MediaAccess`). A browser can send neither the
+ * platform's Referer nor the session's cookies, so `session_bound` means the
+ * links will not play or save here whatever the console does.
+ */
+interface MediaAccessLike {
+  referer?: string | null
+  session_bound?: boolean
+}
+
 interface MediaLike {
   covers?: MediaImage[]
   video?: VideoStream | null
   streams?: VideoStream[]
   images?: AlbumImage[]
+  access?: MediaAccessLike | null
 }
 
 interface AuthorLike {
@@ -355,6 +369,12 @@ export function BatchParse({ skipExisting, onQueued }: BatchParseProps) {
   const [rows, setRows] = useState<ParseRow[]>([])
   const [preview, setPreview] = useState<string | null>(null)
   const [downloads, setDownloads] = useState<Record<string, DownloadState>>({})
+  /**
+   * The row whose preview ran out of mirrors. Douyin's CDN serves a browser
+   * that sends no Referer, which the console never does; a link that wants the
+   * platform's own Referer still fails, and the last `<source>` says so.
+   */
+  const [videoRefused, setVideoRefused] = useState<string | null>(null)
   const trackingRef = useRef(false)
   const cursorRef = useRef(0)
 
@@ -434,11 +454,17 @@ export function BatchParse({ skipExisting, onQueued }: BatchParseProps) {
         for (const [index, url] of group.entries()) {
           const item = items[index] ?? items.find((entry) => entry.url === url)
           const taskId = item?.task_id ?? null
+          // A link asked for again joins the earlier task, which may already
+          // be done - and the batch answer carries its state, not its result.
+          // Taken as terminal, the row was never polled: "Done", every column
+          // empty, and a preview that could not open. Any task id is polled
+          // at least once.
+          const submitted = item?.state ?? 'queued'
           created.push({
             id: nextRowId(),
             url,
             taskId,
-            state: taskId ? (item?.state ?? 'queued') : 'failed',
+            state: taskId ? (TERMINAL.has(submitted) ? 'running' : submitted) : 'failed',
             error: taskId
               ? null
               : {
@@ -965,6 +991,14 @@ export function BatchParse({ skipExisting, onQueued }: BatchParseProps) {
   const previewVideo = videoMirrors(previewContent)
   const previewImages = previewContent?.media?.images ?? []
   const previewCover = coverMirrors(previewContent)[0] ?? null
+  // TikTok binds a video's links to the session that fetched them (issue 831):
+  // the CDN wants that session's tt_chain_token, which a browser does not
+  // have. The player is still offered, because the www.tiktok.com play mirrors
+  // further down the list answer some exits unbound; what changes is the
+  // browser save button, which cannot send the token, and what is said when
+  // nothing played.
+  const previewBound = previewContent?.media?.access?.session_bound === true
+  const previewRefused = videoRefused !== null && videoRefused === previewRow?.id
   const failedRetryable = rows.filter((row) => retryable(row))
 
   return (
@@ -1132,8 +1166,20 @@ export function BatchParse({ skipExisting, onQueued }: BatchParseProps) {
               ) : null}
             </div>
 
-            {previewVideo.length > 0 ? (
+            {previewVideo.length > 0 && previewRefused ? (
+              <OffBrowserVideo
+                cover={previewCover}
+                reason={previewBound ? 'bound' : 'refused'}
+                saving={queue.isPending}
+                onSave={() => {
+                  queue.mutate([previewRow])
+                }}
+              />
+            ) : null}
+
+            {previewVideo.length > 0 && !previewRefused ? (
               <video
+                key={previewRow.id}
                 controls
                 playsInline
                 preload="metadata"
@@ -1145,8 +1191,21 @@ export function BatchParse({ skipExisting, onQueued }: BatchParseProps) {
                   border: '1px solid var(--border-subtle)',
                 }}
               >
-                {previewVideo.map((url) => (
-                  <source key={url} src={url} />
+                {previewVideo.map((url, index) => (
+                  <source
+                    key={url}
+                    src={url}
+                    // A failing <source> moves the element on to the next one
+                    // and the <video> itself fires nothing, so the last one is
+                    // the only place "none of them played" can be heard.
+                    onError={
+                      index === previewVideo.length - 1
+                        ? () => {
+                            setVideoRefused(previewRow.id)
+                          }
+                        : undefined
+                    }
+                  />
                 ))}
               </video>
             ) : null}
@@ -1228,15 +1287,36 @@ export function BatchParse({ skipExisting, onQueued }: BatchParseProps) {
 
             <Card title={t('parse.downloadTitle')} description={t('parse.downloadDescription')}>
               <div className="u-stack-sm">
-                <DownloadButton
-                  label={t('parse.downloadVideo')}
-                  mirrors={previewVideo}
-                  state={downloads[`${previewRow.id}:video`]}
-                  onDownload={() => {
-                    void download(`${previewRow.id}:video`, previewVideo, 'video.mp4')
-                  }}
-                  emptyLabel={t('parse.noVideo')}
-                />
+                {(previewBound || previewRefused) && previewVideo.length > 0 ? (
+                  // The browser save would ask the same mirrors the same way
+                  // and fail the same way, then open one in a tab that fails
+                  // too and blame CORS. The instance sends what they want.
+                  <div className="u-row u-wrap">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      loading={queue.isPending}
+                      onClick={() => {
+                        queue.mutate([previewRow])
+                      }}
+                    >
+                      {t('parse.downloadVideo')}
+                    </Button>
+                    <span className="u-xs u-muted">
+                      {t(previewBound ? 'parse.offBrowser.saveHintBound' : 'parse.offBrowser.saveHint')}
+                    </span>
+                  </div>
+                ) : (
+                  <DownloadButton
+                    label={t('parse.downloadVideo')}
+                    mirrors={previewVideo}
+                    state={downloads[`${previewRow.id}:video`]}
+                    onDownload={() => {
+                      void download(`${previewRow.id}:video`, previewVideo, 'video.mp4')
+                    }}
+                    emptyLabel={t('parse.noVideo')}
+                  />
+                )}
                 <DownloadButton
                   label={t('parse.downloadCover')}
                   mirrors={coverMirrors(previewContent)}
@@ -1344,6 +1424,55 @@ function DownloadButton({
         <span className="u-xs" style={{ color: 'var(--caution)' }}>
           {t('parse.mirrorBlocked')}
         </span>
+      ) : null}
+    </div>
+  )
+}
+
+/**
+ * Where the player was, once none of the video's links played: the cover the
+ * CDN does serve, why, and the way that works - this instance's downloader,
+ * which sends what the platform asks for and lists the file below.
+ */
+function OffBrowserVideo({
+  cover,
+  reason,
+  saving,
+  onSave,
+}: {
+  cover: string | null
+  reason: 'bound' | 'refused'
+  saving: boolean
+  onSave: () => void
+}) {
+  const { t } = useTranslation(['console'])
+  // A status region: it replaces the player after the last mirror fails,
+  // seconds after the drawer opened, and a screen reader should hear why.
+  // The reason first and the cover capped: most covers are portrait, and at
+  // full width one pushed the explanation below the drawer's first screen.
+  return (
+    <div className="u-stack-sm" role="status">
+      <Banner tone="accent" icon={<InfoIcon size={14} />}>
+        <p style={{ margin: 0 }}>{t(`parse.offBrowser.${reason}`)}</p>
+        <div className="u-row" style={{ marginTop: 'var(--space-2)' }}>
+          <Button size="sm" variant="secondary" loading={saving} onClick={onSave}>
+            {t('parse.offBrowser.save')}
+          </Button>
+        </div>
+      </Banner>
+      {cover ? (
+        <img
+          src={cover}
+          alt=""
+          style={{
+            width: '100%',
+            maxHeight: '50vh',
+            objectFit: 'contain',
+            borderRadius: 'var(--radius)',
+            background: 'var(--bg-inset)',
+            border: '1px solid var(--border-subtle)',
+          }}
+        />
       ) : null}
     </div>
   )

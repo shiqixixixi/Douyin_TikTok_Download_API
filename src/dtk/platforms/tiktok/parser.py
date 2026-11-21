@@ -45,6 +45,7 @@ from dtk.models import (
     LiveStatus,
     LiveStream,
     Media,
+    MediaAccess,
     Mix,
     Music,
     MusicDetail,
@@ -70,6 +71,13 @@ _NAME: Final = _PLATFORM.value
 
 WEB_DOMAIN: Final = "https://www.tiktok.com"
 
+#: Covers and album slides are served to anyone who sends the Referer.
+ACCESS: Final = MediaAccess(referer=f"{WEB_DOMAIN}/")
+#: A video's links say `tk=tt_chain_token`: the CDN serves them only with the
+#: tt_chain_token cookie of the session that fetched them, and that cookie is
+#: an identity's, not the caller's (#831).
+VIDEO_ACCESS: Final = MediaAccess(referer=f"{WEB_DOMAIN}/", session_bound=True)
+
 #: Status codes seen on risk-control responses rather than on data.
 #:
 #: Recovered from V4's behaviour; the captured-response task in
@@ -78,6 +86,37 @@ WEB_DOMAIN: Final = "https://www.tiktok.com"
 #: are classified above this layer, and misfiling one as risk control would
 #: cool down a healthy identity every time somebody looks up a deleted video.
 RISK_STATUS_CODES: Final[frozenset[int]] = frozenset({10000, 10101})
+
+#: Where a session's device id is read: any page of the web app states it, and
+#: the home page is the one a visitor opens first.
+DEVICE_ID_PAGE: Final = f"{WEB_DOMAIN}/"
+
+#: The page's own state, embedded for the client to pick up.
+_REHYDRATION: Final = re.compile(
+    r'<script[^>]*id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', re.S
+)
+
+
+def read_device_id(page: str) -> str | None:
+    """The device id a web app page states for the session that opened it.
+
+    ``webapp.app-context.wid``: what TikTok's own client sends as ``device_id``.
+    It follows the session's tt_chain_token - the same 19 digits on every page,
+    a different number for every identity (measured 2026-11-20) - and the video
+    links the API hands out open only for that pair (#831).
+    """
+    match = _REHYDRATION.search(page)
+    if match is None:
+        return None
+    try:
+        state = json.loads(match.group(1))
+    except ValueError:
+        return None
+    scope = state.get("__DEFAULT_SCOPE__") if isinstance(state, dict) else None
+    context = scope.get("webapp.app-context") if isinstance(scope, dict) else None
+    wid = context.get("wid") if isinstance(context, dict) else None
+    text = str(wid) if isinstance(wid, str | int) else ""
+    return text if text.isdigit() else None
 
 
 def detect_risk_control(payload: Mapping[str, Any]) -> str | None:
@@ -345,7 +384,7 @@ def _media(
         images = _album_images(image_post) if image_post is not None else []
         if require_media and not images:
             raise item.missing("imagePost")
-        return Media(covers=covers, video=None, streams=[], images=images)
+        return Media(covers=covers, video=None, streams=[], images=images, access=ACCESS)
 
     main: VideoStream | None = None
     streams: list[VideoStream] = []
@@ -367,7 +406,8 @@ def _media(
         if video is None:
             raise item.missing("video")
         raise video.missing("playAddr")
-    return Media(covers=covers, video=main, streams=streams, images=[])
+    access = VIDEO_ACCESS if main is not None or streams else ACCESS
+    return Media(covers=covers, video=main, streams=streams, images=[], access=access)
 
 
 def _tags(item: Node) -> list[str]:

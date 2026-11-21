@@ -46,6 +46,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, Final
+from urllib.parse import urlsplit
 
 from browser_rpc.backends.base import (
     BackendInfo,
@@ -53,7 +54,7 @@ from browser_rpc.backends.base import (
     MintPlan,
     SignPlan,
 )
-from browser_rpc.errors import BackendFailure, BackendUnavailable
+from browser_rpc.errors import BackendFailure, BackendUnavailable, RpcError, Suspect
 from browser_rpc.geo import GeoProfile
 from browser_rpc.settings import Settings
 from browser_rpc.validation import (
@@ -199,10 +200,73 @@ READY_POLL_GROWTH: float = 1.6
 #: Consecutive probe exceptions that mean the page is gone rather than slow.
 READY_MAX_CONSECUTIVE_ERRORS: int = 3
 
+#: The error `SIGN_SCRIPT` answers with when the page it runs in is no longer on
+#: the platform. A wire value between the script and `CloakSigningContext`.
+PAGE_LEFT_PLATFORM: Final = "page_left_platform"
+
+#: Schemes a signing page can be on and still be the platform's page. Every
+#: other one - about:blank, chrome-error://chromewebdata/, data: - has an opaque
+#: origin, and none of them holds the SDK.
+PAGE_SCHEMES: Final = frozenset({"http", "https"})
+
+#: How much of a browser error reaches a message. Playwright appends a
+#: JavaScript stack after the first line, and the first line is the finding.
+ERROR_EXCERPT_CHARS: Final = 300
+
+#: What Playwright says about a page whose renderer died. Kept in every crash
+#: message of ours as well, because it is the phrase the troubleshooting guide
+#: and the self-check tell an operator to look for: the crash event used to be
+#: reported as "its renderer crashed", which nobody could find in the docs.
+TARGET_CRASHED: Final = "Target crashed"
+
+#: Every way the driver says a page or its browser died, as phrased by
+#: Playwright 1.64. A renderer killed while ``goto`` waits is "Page crashed"
+#: (``Page._didCrash``), not "Target crashed", which only the CDP crash error is
+#: rewritten to; a dead browser process is the closed-target default. Matching
+#: only the first blamed an OOM-killed page load on the exit (review of the
+#: #830 fix), which is the misattribution `Suspect` was added to stop.
+BROWSER_DEATH: Final = (
+    TARGET_CRASHED,
+    "Page crashed",
+    "Navigation failed because page crashed",
+    "Target page, context or browser has been closed",
+    "Browser has been closed",
+)
+
+
+def names_a_dead_browser(text: str) -> bool:
+    """Whether a driver message says the page or its browser died."""
+    return any(phrase in text for phrase in BROWSER_DEATH)
+
+
+#: What Playwright says when the document an evaluate ran in was replaced
+#: under it: the page was navigating. On its own it names a driver detail, and
+#: the page's URL can still be the platform's at that instant.
+NAVIGATING: Final = "Execution context was destroyed"
+
+#: How long a signature that met a navigation watches the driver for the page's
+#: new address, and how often it looks. The driver learns it a moment after the
+#: old document is torn down. Measured in dtk-sig2 on 2026-11-20, reloading a
+#: warm TikTok page through a route that refuses every connection: a signature
+#: sent 0.05s in met "Execution context was destroyed" while the page still
+#: read as tiktok.com, and waiting for a load state returned at once without
+#: changing that; from 0.15s on the page read as chrome-error://chromewebdata.
+#: Bounded well below the sign budget.
+NAVIGATION_SETTLE_SECONDS: Final = 1.0
+NAVIGATION_POLL_SECONDS: Final = 0.05
+
+#: How long cleaning up after a failed open may take. A failed open can be a
+#: cancelled one, and a close that hangs would hold the cancellation up with it.
+CLOSE_TIMEOUT_SECONDS: Final = 5.0
+
 #: The session cookie a mint must come home with, per platform, as
 #: ``(name, minimum length)``. Only TikTok has one: its ``msToken`` arrives twice,
 #: and the short first value produces signatures the platform refuses. Douyin has
 #: no equivalent - its signing inputs are present as soon as the jar is.
+#:
+#: It is also what a signing page loaded with such a token has to seal before
+#: it counts as ready - see `_await_sdk` - because the token a page seals is the
+#: one its request carries.
 SESSION_COOKIE_MINIMUMS: Final[Mapping[Platform, tuple[str, int]]] = MappingProxyType(
     {Platform.TIKTOK: ("msToken", 144)}
 )
@@ -220,10 +284,30 @@ SESSION_COOKIE_POLL_SECONDS: Final = 0.5
 #: msToken and a vestigial one-character X-Bogus. Those sets have changed before
 #: and will change again, and a table of expected names would silently drop
 #: whatever was added next.
+#:
+#: A page that has left the platform says so instead of signing. Issue #830: a
+#: warm TikTok page whose navigation after load failed sat on
+#: chrome-error://chromewebdata/, and the shim was still there - init scripts
+#: run on every document, error pages and about:blank included - so the guard
+#: below passed and the script died resolving the captured URL against
+#: `location.origin`, which on an opaque origin is the string "null". Every
+#: signature from that page came back as "TypeError: Failed to construct 'URL':
+#: Invalid base URL", on both of the service's attempts. The captured URL is
+#: now resolved against the target, which is absolute and is all the
+#: parameters were ever read from; and the page's whereabouts are checked
+#: first, so the error names where the page went rather than a JavaScript
+#: detail of what failed there.
 SIGN_SCRIPT = """
 async (input) => {
   const state = window.__dtkSign;
   if (!state) return { error: 'capture shim not installed' };
+
+  const host = location.hostname;
+  const onPlatform = (location.protocol === 'https:' || location.protocol === 'http:')
+    && (!input.domain || host === input.domain || host.endsWith('.' + input.domain));
+  if (!onPlatform) {
+    return { error: 'page_left_platform', at: host ? `${location.protocol}//${host}` : location.protocol };
+  }
 
   const target = input.query ? `${input.url}?${input.query}` : input.url;
   const before = new Set([...new URL(target).searchParams.keys()]);
@@ -247,7 +331,7 @@ async (input) => {
   }
 
   if (!state.url) return { error: 'the SDK did not dispatch a request' };
-  const signed = new URL(state.url, location.origin);
+  const signed = new URL(state.url, input.url);
   const added = {};
   for (const [k, v] of signed.searchParams) {
     if (!before.has(k)) added[k] = v;
@@ -318,24 +402,183 @@ def proxy_settings(proxy: ProxyEndpoint | None) -> dict[str, str] | None:
     return settings
 
 
+def platform_domain(platform: Platform) -> str:
+    """The domain a platform's signing page has to stay on.
+
+    The cookie domain rather than every domain the platform owns, because the
+    page is only worth anything while it holds the jar, and the jar is
+    installed on this domain: a Douyin page that ended up on iesdouyin.com would
+    sign without the cookies the request will carry.
+    """
+    return COOKIE_DOMAINS[platform].lstrip(".")
+
+
+def off_platform(platform: Platform, url: str | None) -> str | None:
+    """Where a page is when that is not on its platform; None when it is.
+
+    The answer is scheme and host only - "chrome-error://chromewebdata",
+    "about:blank" - never a path or a query, which on a platform page can carry
+    the identity's tokens. An unknown URL is not evidence of anything and
+    answers None.
+    """
+    if not url:
+        return None
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower().rstrip(".")
+    domain = platform_domain(platform)
+    if scheme in PAGE_SCHEMES and (host == domain or host.endswith("." + domain)):
+        return None
+    if host:
+        return f"{scheme}://{host}"
+    # about:blank has no host and its "path" is the whole point; a data: URL's
+    # path is a document, so only about: gets one.
+    return f"about:{parts.path}"[:32] if scheme == "about" else f"{scheme}:"
+
+
+def left_platform_message(platform: Platform, where: str) -> str:
+    """What to say about a signing page found somewhere other than its platform."""
+    return (
+        f"the {platform.value} signing page is no longer on {platform_domain(platform)} "
+        f"(it is on {where}): a navigation after it loaded failed or was blocked - "
+        "look at the exit it loads through (DTK_BROWSER_SIGN_PROXY_URL, the "
+        "identity's proxy, or this host)"
+    )
+
+
+def left_platform(platform: Platform, where: str) -> BackendFailure:
+    """The failure for a signing page found off its platform, attributed to the exit."""
+    return BackendFailure(left_platform_message(platform, where), suspect=Suspect.EXIT)
+
+
+def renderer_crashed(platform: Platform) -> BackendFailure:
+    """The failure for a signing page whose renderer died."""
+    return BackendFailure(
+        f"the {platform.value} signing page's renderer crashed ({TARGET_CRASHED})",
+        suspect=Suspect.BROWSER,
+    )
+
+
+def suspect_of(error: object) -> Suspect | None:
+    """What a driver error implicates, read from its text; None when it says nothing."""
+    if isinstance(error, RpcError):
+        return error.suspect
+    return Suspect.BROWSER if names_a_dead_browser(str(error)) else None
+
+
+def _page_url(page: Any) -> str | None:
+    """The page's current URL, read without running anything in it."""
+    url = getattr(page, "url", None)
+    return url if isinstance(url, str) else None
+
+
+def _excerpt(error: object) -> str:
+    """The first line of a browser error, bounded."""
+    lines = str(error).strip().splitlines()
+    return (lines[0] if lines else type(error).__name__)[:ERROR_EXCERPT_CHARS]
+
+
 class CloakSigningContext:
     """A warm page holding the platform's signing JavaScript in memory."""
 
     def __init__(
-        self, platform: Platform, context: Any, page: Any, profile_dir: str | None = None
+        self,
+        platform: Platform,
+        context: Any,
+        page: Any,
+        profile_dir: str | None = None,
+        user_agent: str | None = None,
     ) -> None:
         self._platform = platform
         self._context = context
         self._page = page
+        self._user_agent = user_agent
         #: Removed on close. A warm context owns its directory exclusively, so
         #: leaving it behind would slowly fill the profile tmpfs across the
         #: rebuild every 30 minutes.
         self._profile_dir = profile_dir
         self._closed = False
+        self._crashed = False
+        # A dead renderer leaves the page object behind, and every evaluate on
+        # it answers "Target crashed" from then on. Hearing about it here is
+        # what lets the service drop the page before a caller's attempt is
+        # spent finding out. Stub pages in the tests have no events.
+        with contextlib.suppress(AttributeError):
+            page.on("crash", self._on_crash)
 
     @property
     def platform(self) -> Platform:
         return self._platform
+
+    @property
+    def user_agent(self) -> str | None:
+        return self._user_agent
+
+    @property
+    def problem(self) -> str | None:
+        """Why this page cannot sign any more, or None while it still can.
+
+        Read without evaluating anything in the page: the service asks before
+        it hands a warm page out, and asking must not cost a probe.
+        """
+        if self._closed:
+            return "it is closed"
+        if self._crashed:
+            return f"its renderer crashed ({TARGET_CRASHED})"
+        is_closed = getattr(self._page, "is_closed", None)
+        if callable(is_closed) and is_closed():
+            return "its page was closed"
+        where = off_platform(self._platform, _page_url(self._page))
+        if where is not None:
+            return f"it left {platform_domain(self._platform)} for {where}"
+        return None
+
+    def _on_crash(self, *_: object) -> None:
+        self._crashed = True
+
+    async def _explain(self, error: Exception) -> BackendFailure:
+        """What an evaluate that raised says about the page, rather than about the driver.
+
+        The precheck in `sign` reads the URL the driver last reported, and that
+        lags a navigation that is failing: in dtk-sig2 a page reloaded through a
+        failing exit reported no problem right after the reload, while it was
+        already being replaced by chrome-error://chromewebdata. A signature
+        arriving in that window ran the script, and the attempt failed with
+        "signing script failed: Page.evaluate: Execution context was destroyed,
+        most likely because of a navigation" - spent, and its log line silent
+        about the page having left the platform. So a navigation is waited out
+        briefly and the page asked again where it is.
+        """
+        detail = _excerpt(error)
+        if self._crashed or names_a_dead_browser(detail):
+            return renderer_crashed(self._platform)
+        navigating = NAVIGATING in detail
+        where = (
+            await self._landing()
+            if navigating
+            else off_platform(self._platform, _page_url(self._page))
+        )
+        if where is not None:
+            return left_platform(self._platform, where)
+        if navigating:
+            return BackendFailure(
+                f"the {self._platform.value} signing page was navigating when it was asked "
+                f"to sign, and is still on {platform_domain(self._platform)} ({detail})"
+            )
+        return BackendFailure(f"signing script failed: {detail}", suspect=suspect_of(error))
+
+    async def _landing(self) -> str | None:
+        """Where a navigating page went, once the driver has heard; None if still home.
+
+        Read from the driver's record rather than by evaluating anything: the
+        page is between documents, and an evaluate there is what just failed.
+        """
+        deadline = time.monotonic() + NAVIGATION_SETTLE_SECONDS
+        while True:
+            where = off_platform(self._platform, _page_url(self._page))
+            if where is not None or time.monotonic() >= deadline:
+                return where
+            await asyncio.sleep(NAVIGATION_POLL_SECONDS)
 
     async def sign(self, plan: SignPlan) -> dict[str, str]:
         """Ask the page's own SDK to sign one request and return what it added.
@@ -348,37 +591,65 @@ class CloakSigningContext:
         """
         if self._closed:
             raise BackendFailure("signing context is closed")
+        where = off_platform(self._platform, _page_url(self._page))
+        if where is not None:
+            raise left_platform(self._platform, where)
+        if self._crashed:
+            raise renderer_crashed(self._platform)
 
+        # No User-Agent in here. One used to be sent and `SIGN_SCRIPT` never
+        # read it: the page signs under its own `navigator.userAgent` whatever
+        # the plan says, which is why the service refuses a plan naming one the
+        # platform would not accept before it gets this far (#832).
         payload = {
             "url": plan.url,
             "query": plan.query,
             "method": plan.method or "GET",
-            "userAgent": plan.user_agent or "",
             "body": plan.body,
             "contentType": plan.content_type,
+            "domain": platform_domain(self._platform),
         }
         try:
             result = await self._page.evaluate(SIGN_SCRIPT, payload)
         except Exception as exc:
-            raise BackendFailure(f"signing script failed: {exc}") from exc
+            raise await self._explain(exc) from exc
 
+        if isinstance(result, dict) and result.get("error") == PAGE_LEFT_PLATFORM:
+            # The script's own reading of `location`, for the case the URL the
+            # driver last reported had not caught up with.
+            raise left_platform(self._platform, str(result.get("at") or "unknown")[:64])
         if not isinstance(result, dict) or result.get("error"):
             reason = (
                 (result or {}).get("error", "no result")
                 if isinstance(result, dict)
                 else "no result"
             )
+            # For whoever edits this file: re-run the live analysis in
+            # docs/design/04-transport-signing.md before touching the script.
+            # Not in the message, which an operator reads in a log or a 502
+            # body, where that path does not exist (docs/ is not shipped).
             raise BackendFailure(
                 f"the {self._platform.value} SDK produced no signature ({reason}). "
                 "Either the page had not finished loading its security bundle, or "
-                "the platform changed how it signs; re-run the live analysis in "
-                "docs/design/04-transport-signing.md before editing this file."
+                "the platform changed how it signs; if this exit loads the site, "
+                "open an issue."
             )
 
-        signed = _string_fields(result.get("params"))
-        if not signed:
+        signed = _signed_fields(result.get("params"))
+        if not any(signed.values()):
             raise BackendFailure(f"the {self._platform.value} SDK added no parameters")
-        # NOTHING is added here. What the SDK put in the URL is the whole answer.
+        # NOTHING is added here, and nothing taken away. What the SDK put in the
+        # URL is the whole answer, empty values included.
+        #
+        # Issue #832: a TikTok page seals `msToken=` with no value while its
+        # SDK has no token of its own yet, and X-Gnarly's query hash covers
+        # that `&msToken=`. This used to go through the copier the fingerprint
+        # uses, which drops an empty value as "not reported", so the request
+        # went out without the pair its seal names. Kept now for fidelity: it
+        # was not shown to change TikTok's answer - replayed under one seal on
+        # 2026-11-20, the query with and without the pair answered alike, 8/8
+        # each, and what decided the outcome was whether the msToken in the
+        # Cookie header was live.
         #
         # There used to be a "helpful" fallback that appended the page's msToken
         # cookie when the SDK had not put one in the query. It is a signature
@@ -415,6 +686,7 @@ class CloakBackend:
         self._driver: Any = None
         self._version: str | None = None
         self._chromium_major: int | None = None
+        self._user_agent: str | None = None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -469,6 +741,7 @@ class CloakBackend:
             version=self._version,
             chromium_major=self._chromium_major,
             pin=self._settings.backend_pin,
+            user_agent=self._user_agent,
         )
 
     # -- contexts ---------------------------------------------------------
@@ -532,7 +805,9 @@ class CloakBackend:
             raise BackendFailure(f"could not read the page fingerprint: {exc}") from exc
         return _string_fields(values)
 
-    async def _await_session_cookie(self, context: Any, plan: MintPlan) -> dict[str, str]:
+    async def _await_session_cookie(
+        self, context: Any, plan: MintPlan, page: Any = None
+    ) -> dict[str, str]:
         """Read the jar once the platform's session token is the usable one.
 
         The flat wait above is enough for the guest cookies, but not always for
@@ -547,6 +822,11 @@ class CloakBackend:
         apart, so an identity minted too early is a permanently broken pool entry
         that reports as a signing failure. Failing the mint is the cheaper
         outcome, and the caller already retries.
+
+        A landing page that has left the platform ends the wait at once: no
+        token can arrive on chrome-error://, and the 15 seconds spent finding
+        that out used to end in "msToken is 0 characters", which reads as a
+        timing problem and is an exit problem (issue #830).
         """
         minimum = SESSION_COOKIE_MINIMUMS.get(plan.platform)
         deadline = time.monotonic() + SESSION_COOKIE_WAIT_SECONDS
@@ -554,14 +834,15 @@ class CloakBackend:
         if minimum is None:
             return cookies
         name, length = minimum
-        while len(cookies.get(name, "")) < length and time.monotonic() < deadline:
+        where = off_platform(plan.platform, _page_url(page))
+        while len(cookies.get(name, "")) < length and where is None and time.monotonic() < deadline:
             await asyncio.sleep(SESSION_COOKIE_POLL_SECONDS)
             cookies = await _collect_cookies(context)
+            where = off_platform(plan.platform, _page_url(page))
         held = len(cookies.get(name, ""))
         if held < length:
             raise BackendFailure(
-                f"{plan.platform.value} {name} is {held} characters after "
-                f"{SESSION_COOKIE_WAIT_SECONDS:.0f}s; the usable token is at least {length}"
+                _session_cookie_shortfall(plan.platform, name, held, length, where)
             )
         return cookies
 
@@ -587,7 +868,7 @@ class CloakBackend:
                 raise BackendFailure(f"could not load {plan.landing_url}: {exc}") from exc
 
             fingerprint = await self._read_fingerprint(page)
-            cookies = await self._await_session_cookie(context, plan)
+            cookies = await self._await_session_cookie(context, plan, page)
             if not cookies:
                 raise BackendFailure(
                     f"{plan.platform.value} set no cookies; the exit is most likely blocked"
@@ -597,6 +878,8 @@ class CloakBackend:
             major = browser_major_of(user_agent)
             if major is not None:
                 self._chromium_major = major
+            if user_agent:
+                self._user_agent = user_agent
             return MintedProfile(
                 cookies=cookies,
                 user_agent=user_agent,
@@ -634,9 +917,18 @@ class CloakBackend:
         # rebuilt page collide with the one it is replacing. It being unique
         # also means no trace of the previous identity survives a rebind.
         profile_dir = f"{self._settings.profile_root}/warm-{platform.value}-{uuid.uuid4().hex[:8]}"
-        context = await self._launch_context(
-            profile_dir, geo, proxy, self._settings.context_open_timeout_seconds
-        )
+        try:
+            context = await self._launch_context(
+                profile_dir, geo, proxy, self._settings.context_open_timeout_seconds
+            )
+        except BaseException:
+            # Chromium creates the directory before it fails to start, and
+            # nothing else knows its name. Seen in dtk-sig2 under memory
+            # pressure: "could not open a browser context: ... has been closed"
+            # left a 13-16 MiB warm-douyin-* behind on the 1g profile tmpfs, and
+            # a run of failed launches fills it.
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            raise
         try:
             jar = cookie_payload(platform, cookies)
             if jar:
@@ -644,27 +936,46 @@ class CloakBackend:
                 # document loads and caches what it read.
                 await context.add_cookies(jar)
             page = await self._page_of(context)
-            await page.goto(
-                page_url,
-                wait_until="domcontentloaded",
-                timeout=self._settings.context_open_timeout_seconds * 1000,
+            try:
+                await page.goto(
+                    page_url,
+                    wait_until="domcontentloaded",
+                    timeout=self._settings.context_open_timeout_seconds * 1000,
+                )
+            except Exception as exc:
+                # A navigation that failed is the exit's doing unless the
+                # browser says it died; either way the first line is the finding
+                # and Playwright's call log after it is not.
+                raise BackendFailure(
+                    f"could not load {page_url}: {_excerpt(exc)}",
+                    suspect=suspect_of(exc) or Suspect.EXIT,
+                ) from exc
+            await _await_sdk(
+                page,
+                platform,
+                self._settings.sdk_ready_timeout_seconds,
+                expect_token=_holds_session_token(platform, cookies),
             )
-            await _await_sdk(page, platform, self._settings.sdk_ready_timeout_seconds)
             fingerprint = await self._read_fingerprint(page)
-            major = browser_major_of(fingerprint.get("userAgent"))
+            # Kept whole now, not just its major: it is the User-Agent every
+            # signature from this page carries (#832).
+            user_agent = fingerprint.get("userAgent")
+            major = browser_major_of(user_agent)
             if major is not None:
                 self._chromium_major = major
+            if user_agent:
+                self._user_agent = user_agent
             await _send_to_background(context, page, platform)
-        except Exception as exc:
-            try:
-                await context.close()
-            except Exception:
-                logger.debug("backend.cloak.warm_context_close_failed", exc_info=True)
-            shutil.rmtree(profile_dir, ignore_errors=True)
-            raise BackendFailure(
-                f"could not warm a signing page for {platform.value}: {exc}"
-            ) from exc
-        return CloakSigningContext(platform, context, page, profile_dir)
+        except BaseException as exc:
+            # BaseException, so a service-side timeout - which cancels this
+            # coroutine - closes the browser it launched too. It used to skip
+            # this block entirely and leave a live Chromium and its profile
+            # behind for every open that ran out of time.
+            await _abandon(context, profile_dir)
+            if not isinstance(exc, Exception):
+                raise
+            raise _warm_failure(platform, exc) from exc
+        return CloakSigningContext(platform, context, page, profile_dir, user_agent)
 
 
 async def _send_to_background(context: Any, page: Any, platform: Platform) -> None:
@@ -694,23 +1005,78 @@ async def _send_to_background(context: Any, page: Any, platform: Platform) -> No
         logger.warning("backend.cloak.background_failed platform=%s error=%s", platform.value, exc)
 
 
-async def _await_sdk(page: Any, platform: Platform, budget: float) -> None:
-    """Block until the page can actually sign, by asking it to.
+async def _await_sdk(
+    page: Any, platform: Platform, budget: float, *, expect_token: bool = False
+) -> None:
+    """Block until the page can actually sign, by asking it to; raise if it never does.
 
     The probe is a real signature over a throwaway query, which is the only
     question whose answer is not a proxy for the one that matters. It costs no
     upstream request - the capture shim aborts the fetch before it leaves the
     browser - so polling it is cheap.
 
-    Not fatal on timeout. A context that still cannot sign is returned anyway,
-    and the caller's own signature then fails with the SDK's message, which says
-    more about what is wrong than "opening a context timed out" would.
+    Fatal, and it was not always. This used to log and return when the budget
+    ran out or the page stopped answering, on the reasoning that the caller's
+    own signature would then fail with the SDK's message, which says more than
+    "opening a context timed out". The point about the message was right and the
+    conclusion was not. Issue #830: a TikTok page that left tiktok.com for
+    chrome-error:// after loading answered every probe with an exception, was
+    handed out after 1.3s anyway, and every signature from it failed with a
+    JavaScript TypeError that named nothing the operator could act on - on both
+    of the service's attempts, each of which paid for a full open first. A
+    rate-limit page that never grew an SDK went out the same way and failed as
+    "the platform changed how it signs". So the failure is raised here, carrying
+    the probe's last answer - which keeps what the old reasoning wanted - and it
+    reaches the service as a failed open, whose retry opens a fresh page.
+
+    On a page loaded with a jar that holds a usable msToken (``expect_token``)
+    a probe that signs is not yet enough: the msToken it seals has to be
+    usable too (`SESSION_COOKIE_MINIMUMS`). Issue #832, measured on 2026-11-20:
+    such a page seals an EMPTY msToken for its first 0.1-1.4s - longer through
+    the service, at least 4s on two of four rebinds - because the SDK seals
+    from its own storage, which is still empty. This answered "ready" on the
+    first probe that signed, so the first caller after every rebind got one of
+    those, and its request went out with whatever msToken the jar held: an
+    empty seal overrides nothing. Held to it, six such pages sealed a
+    152-character token within 0.8-3.5s, and the request then carries the
+    page's fresh token in its Cookie header (`dtk.signing.rpc`), whatever state
+    the jar's own token is in.
+
+    That, and not the empty seal, is what the gate buys. The token in the
+    Cookie header is what TikTok judges: replayed under one empty seal, the
+    jar's live token answered 8/8 and a stale one was refused; the 4/4
+    refusals first measured on such early signatures, with what was taken for
+    a live jar token, were not reproduced. A probe that seals no msToken at
+    all is judged as before.
+
+    Not for any other page. An anonymous one (prewarm's, the self-check's
+    reference) and one for a jar with no token each sealed only the
+    128-character bootstrap token for the whole 25s, once, and holding them to
+    it turns what they always answered at once into a 25s failure - which
+    nothing measured says is the better outcome for them. The cost is known:
+    the first request after a rebind for a jar with no token is refused - 0/6
+    in the #832 review, in every query and cookie variant - as it was before
+    the gate, and puts the identity in cooldown; the same page signed about 60s
+    later sealed a 152-character token and answered 2/2. A short bounded wait
+    would not reach that, and a 60s one would hold every such rebind past the
+    caller's signing budget. Such a jar is a mint that did not finish, and
+    the remedy is the one for that.
     """
-    probe = {"url": READY_PROBE_URLS[platform], "query": "dtk_ready=1", "method": "GET"}
+    domain = platform_domain(platform)
+    probe = {
+        "url": READY_PROBE_URLS[platform],
+        "query": "dtk_ready=1",
+        "method": "GET",
+        "domain": domain,
+    }
     deadline = time.monotonic() + budget
     started = time.monotonic()
     delay = READY_POLL_SECONDS
     attempts = 0
+    last_answer = "no probe answered"
+    #: The length of the msToken the last probe sealed when that was all that
+    #: kept the page from being ready; None while no probe has signed.
+    sealed_short: int | None = None
     # A page whose target has crashed answers every probe with an exception and
     # will never recover, so waiting out the whole budget only delays the retry
     # that could still succeed. Consecutive, because one failure can just be a
@@ -718,10 +1084,43 @@ async def _await_sdk(page: Any, platform: Platform, budget: float) -> None:
     consecutive_errors = 0
     while True:
         attempts += 1
+        # Before the probe and from the driver's own record, so a page that has
+        # already gone is named without running anything in it.
+        where = off_platform(platform, _page_url(page))
+        if where is not None:
+            _log_left(platform, where, started, attempts)
+            raise left_platform(platform, where)
         try:
             result = await page.evaluate(SIGN_SCRIPT, probe)
+        except Exception as exc:  # a navigation mid-poll, or a crashed target
+            consecutive_errors += 1
+            last_answer = _excerpt(exc)
+            logger.debug("backend.cloak.ready_probe_failed error=%s", last_answer)
+            if consecutive_errors >= READY_MAX_CONSECUTIVE_ERRORS:
+                elapsed = time.monotonic() - started
+                logger.warning(
+                    "backend.cloak.ready_page_gone platform=%s after=%.1fs probes=%d",
+                    platform.value,
+                    elapsed,
+                    attempts,
+                )
+                where = off_platform(platform, _page_url(page))
+                if where is not None:
+                    raise left_platform(platform, where) from exc
+                raise BackendFailure(
+                    f"the {platform.value} signing page stopped answering after "
+                    f"{elapsed:.1f}s and {attempts} probes: {last_answer}",
+                    suspect=suspect_of(exc),
+                ) from exc
+        else:
             consecutive_errors = 0
-            if isinstance(result, dict) and result.get("params"):
+            params = result.get("params") if isinstance(result, dict) else None
+            sealed_short = (
+                _short_session_token(platform, params)
+                if expect_token and isinstance(params, dict)
+                else None
+            )
+            if params and sealed_short is None:
                 logger.info(
                     "backend.cloak.sdk_ready platform=%s after=%.1fs probes=%d",
                     platform.value,
@@ -729,27 +1128,166 @@ async def _await_sdk(page: Any, platform: Platform, budget: float) -> None:
                     attempts,
                 )
                 return
-        except Exception as exc:  # a navigation mid-poll, or a crashed target
-            consecutive_errors += 1
-            logger.debug("backend.cloak.ready_probe_failed error=%s", exc)
-            if consecutive_errors >= READY_MAX_CONSECUTIVE_ERRORS:
-                logger.warning(
-                    "backend.cloak.ready_page_gone platform=%s after=%.1fs probes=%d",
-                    platform.value,
-                    time.monotonic() - started,
-                    attempts,
-                )
-                return
+            if isinstance(result, dict) and result.get("error") == PAGE_LEFT_PLATFORM:
+                where = str(result.get("at") or "unknown")[:64]
+                _log_left(platform, where, started, attempts)
+                raise left_platform(platform, where)
+            last_answer = (
+                str(result.get("error"))[:ERROR_EXCERPT_CHARS]
+                if isinstance(result, dict) and result.get("error")
+                else "no result"
+            )
         if time.monotonic() >= deadline:
             logger.warning(
-                "backend.cloak.sdk_never_ready platform=%s waited=%.0fs probes=%d",
+                "backend.cloak.sdk_never_ready platform=%s waited=%.0fs probes=%d sealed_token=%s",
                 platform.value,
                 budget,
                 attempts,
+                "-" if sealed_short is None else sealed_short,
             )
-            return
+            if sealed_short is not None:
+                raise _unusable_sealed_token(platform, sealed_short, budget, attempts)
+            # Not the exit's fault by default, and the wording must not make it
+            # so. A page that stays on the platform and never signs is either
+            # one whose bundle never arrived or one whose bundle no longer
+            # signs this way; the second is the platform moving, and only the
+            # live analysis can tell it apart from the first. The sentence is
+            # the one `sign` gives an SDK that added nothing, which is where a
+            # page that never signed used to end up saying it, before this was
+            # fatal (a review of #830's fix found it pinned on the exit
+            # instead). The quoted answer goes last:
+            # it can run to 300 characters, and a reader that keeps only the
+            # head of this message should lose the quote, not the remedy.
+            raise BackendFailure(
+                f"the {platform.value} signing page could not sign within {budget:.0f}s "
+                f"({attempts} probes): either its security bundle did not load, or the "
+                "platform changed how it signs - if this exit loads the site, open an "
+                f"issue. Its last answer: {last_answer}",
+                suspect=Suspect.BUNDLE,
+            )
         await asyncio.sleep(delay)
         delay = min(delay * READY_POLL_GROWTH, READY_POLL_MAX_SECONDS)
+
+
+async def _abandon(context: Any, profile_dir: str) -> None:
+    """Close a context whose open failed, and remove its profile, whatever happens."""
+    try:
+        await asyncio.wait_for(context.close(), CLOSE_TIMEOUT_SECONDS)
+    except Exception:
+        logger.debug("backend.cloak.warm_context_close_failed", exc_info=True)
+    finally:
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+
+def _warm_failure(platform: Platform, error: Exception) -> BackendFailure:
+    """A failed open, carrying what the failure implicates.
+
+    Our own messages pass through whole - they are one sentence, and the
+    excerpt limit would cut the remedy off the end of the longest. A driver's
+    message is cut to its first line.
+    """
+    detail = error.message if isinstance(error, RpcError) else _excerpt(error)
+    return BackendFailure(
+        f"could not warm a signing page for {platform.value}: {detail}",
+        suspect=suspect_of(error),
+    )
+
+
+def _log_left(platform: Platform, where: str, started: float, attempts: int) -> None:
+    logger.warning(
+        "backend.cloak.page_left_platform platform=%s at=%s after=%.1fs probes=%d",
+        platform.value,
+        where,
+        time.monotonic() - started,
+        attempts,
+    )
+
+
+def _session_cookie_shortfall(
+    platform: Platform, name: str, held: int, length: int, where: str | None
+) -> str:
+    """Why a mint came home without a usable session token, by how short it fell.
+
+    The three cases point at different things. Zero means nothing of the
+    platform's app answered at all - measured on a healthy TikTok load, the
+    first token arrives about 1.9s in on an app API response, not on the HTML
+    document - so the exit is the suspect. A short token means the app answered
+    and the SDK had not replaced its bootstrap value yet. A page somewhere else
+    entirely says where it went.
+    """
+    if where is not None:
+        return (
+            f"{platform.value} {name} is {held} characters: the landing page left "
+            f"{platform_domain(platform)} for {where} before the platform's app answered - "
+            "look at the exit this mint goes through"
+        )
+    shortfall = (
+        f"{platform.value} {name} is {held} characters after "
+        f"{SESSION_COOKIE_WAIT_SECONDS:.0f}s; the usable token is at least {length}"
+    )
+    if held == 0:
+        return (
+            f"{shortfall}. None arrived at all, and the first one comes on an app API "
+            "response rather than on the page, so nothing of the platform's app answered "
+            "through this exit"
+        )
+    return f"{shortfall}; only the bootstrap token arrived and the SDK never replaced it"
+
+
+def _holds_session_token(platform: Platform, cookies: Mapping[str, str] | None) -> bool:
+    """Whether a jar carries the platform's session token at a usable length."""
+    minimum = SESSION_COOKIE_MINIMUMS.get(platform)
+    if minimum is None:
+        return False
+    name, length = minimum
+    return len((cookies or {}).get(name) or "") >= length
+
+
+def _short_session_token(platform: Platform, params: Mapping[str, Any]) -> int | None:
+    """The length of a sealed session token too short to use; None when it is fine.
+
+    None as well when the platform has no such token or the signature sealed
+    none at all: absence is not a short token, and a page whose SDK stopped
+    appending one should keep signing rather than never be ready.
+    """
+    minimum = SESSION_COOKIE_MINIMUMS.get(platform)
+    if minimum is None:
+        return None
+    name, length = minimum
+    value = params.get(name)
+    if value is None:
+        return None
+    held = len(str(value))
+    return held if held < length else None
+
+
+def _unusable_sealed_token(
+    platform: Platform, held: int, budget: float, attempts: int
+) -> BackendFailure:
+    """The failure for a page that signs but never seals a usable session token.
+
+    Worded like `_session_cookie_shortfall`, because it is the same token
+    failing to arrive: none at all means the platform's app never answered
+    through this exit, a short one that the bootstrap value was never replaced.
+    The probe count is in the "(N probes)" shape the service strips when it
+    compares two attempts' failures.
+    """
+    name, length = SESSION_COOKIE_MINIMUMS[platform]
+    head = (
+        f"the {platform.value} signing page could not seal a usable {name} within "
+        f"{budget:.0f}s ({attempts} probes): it seals one of {held} characters, and the "
+        f"usable token is at least {length}"
+    )
+    if held == 0:
+        return BackendFailure(
+            f"{head}. None has arrived, and it comes on an app API response, so nothing of "
+            "the platform's app answered through this exit",
+            suspect=Suspect.EXIT,
+        )
+    return BackendFailure(
+        f"{head}; only the bootstrap token arrived and the SDK never replaced it",
+        suspect=Suspect.BUNDLE,
+    )
 
 
 def cookie_payload(platform: Platform, cookies: Mapping[str, str] | None) -> list[dict[str, str]]:
@@ -802,13 +1340,33 @@ def _as_int(value: str | None) -> int | None:
 
 
 def _string_fields(value: Any) -> dict[str, str]:
-    """Keep the non-empty string fields of a JavaScript result object."""
+    """Keep the non-empty string fields of a JavaScript result object.
+
+    For what a page reports about itself, where an empty value means it did
+    not say. Never for what an SDK signed - see `_signed_fields`.
+    """
     if not isinstance(value, dict):
         return {}
     return {
         str(key): str(item)
         for key, item in value.items()
         if item is not None and str(item).strip() != ""
+    }
+
+
+def _signed_fields(value: Any) -> dict[str, str]:
+    """The parameters an SDK appended, exactly as appended, empty values included.
+
+    An empty value is still a parameter: the signature covers ``name=`` like
+    any other pair (#832). Only an undefined one is dropped, which a URL
+    cannot carry anyway.
+    """
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): str(item)
+        for key, item in value.items()
+        if item is not None and not isinstance(item, dict | list)
     }
 
 
@@ -821,11 +1379,18 @@ __all__ = [
     "BACKEND_NAME",
     "CAPTURE_INIT_SCRIPT",
     "CHROMIUM_ARGS",
+    "PAGE_LEFT_PLATFORM",
     "SIGN_SCRIPT",
     "CloakBackend",
     "CloakSigningContext",
     "browser_family_of",
     "browser_major_of",
     "build",
+    "left_platform",
+    "left_platform_message",
+    "off_platform",
+    "platform_domain",
     "proxy_settings",
+    "renderer_crashed",
+    "suspect_of",
 ]

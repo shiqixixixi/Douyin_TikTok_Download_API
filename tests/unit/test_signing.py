@@ -43,6 +43,8 @@ import pytest
 from dtk.core.config import RUNTIME_SETTINGS
 from dtk.core.errors import SigningFailed, UpstreamChanged
 from dtk.core.types import Outcome, Platform
+from dtk.signing import registry as registry_module
+from dtk.signing import rpc as rpc_module
 from dtk.signing.base import (
     SIGNER_BROWSER,
     SIGNER_NATIVE,
@@ -112,11 +114,19 @@ from dtk.signing.registry import (
     ExactComparator,
     RegistryPolicy,
     RiskSample,
+    SdkBuildComparator,
+    ShadowSkip,
     SignerRegistry,
     SigningMode,
     SlidingRiskWindow,
+    XBogusComparator,
 )
-from dtk.signing.rpc import RpcSigner
+from dtk.signing.rpc import (
+    RPC_ERROR_EXCERPT_CHARS,
+    USER_AGENT_MISMATCH,
+    RpcSigner,
+    is_user_agent_mismatch,
+)
 
 # --------------------------------------------------------------------------
 # shared inputs
@@ -1413,6 +1423,39 @@ async def test_rpc_signer_names_the_ms_token_its_page_sealed() -> None:
     assert dict(signed.cookies) == {MS_TOKEN_PARAM: "PAGE-TOKEN"}
 
 
+async def test_an_empty_ms_token_the_page_sealed_stays_in_the_query() -> None:
+    """Issue #832: X-Gnarly hashes `&msToken=` even when the value is empty.
+
+    A page with no token of its own yet seals the empty pair, and this client
+    used to drop it, sending a query its seal did not describe. The Cookie
+    header keeps the jar's own token: on 2026-11-20 TikTok refused an empty
+    msToken cookie 0/3 and no msToken cookie 0/3, so there is no override.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"X-Dynosaur": "DYN", "msToken": "", "X-Bogus": "1", "X-Gnarly": "GNA"}
+        )
+
+    session = SigningSession(cookies={MS_TOKEN_PARAM: "JAR-TOKEN", "ttwid": "t"})
+    async with rpc_client(handler) as client:
+        signed = await RpcSigner(client, "http://rpc").sign(TIKTOK_SPEC, FINGERPRINT, session)
+
+    assert signed.query.endswith(f"&X-Dynosaur=DYN&{MS_TOKEN_PARAM}=&X-Bogus=1&X-Gnarly=GNA")
+    assert dict(signed.cookies) == {}
+
+
+async def test_an_empty_signature_is_still_no_signature() -> None:
+    """Keeping empty values must not turn an empty a_bogus into a proof."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"a_bogus": "", "ms_token": "abc"})
+
+    async with rpc_client(handler) as client:
+        with pytest.raises(SigningFailed, match="no signature"):
+            await RpcSigner(client, "http://rpc").sign(DOUYIN_SPEC, FINGERPRINT)
+
+
 async def test_a_signature_over_the_jar_names_no_cookie() -> None:
     """Nothing to override when no page token was sealed, and never natively:
     the native signer seals the jar's own token."""
@@ -1450,7 +1493,132 @@ async def test_rpc_signer_maps_transport_and_status_failures() -> None:
         return httpx.Response(503, json={})
 
     async with rpc_client(failing) as client:
-        with pytest.raises(SigningFailed):
+        with pytest.raises(SigningFailed, match=r"^browser-rpc failed \(HTTP 503\)$"):
+            await RpcSigner(client, "http://rpc").sign(DOUYIN_SPEC, FINGERPRINT)
+
+
+async def test_a_refusal_carries_browser_rpcs_own_reason() -> None:
+    """A service that answered is not "unreachable", and its reason is the finding.
+
+    Issue #830: browser-rpc answered 502 with a body naming what was wrong, and
+    this client reported "browser-rpc unreachable: HTTPStatusError: Server
+    error '502 Bad Gateway'", which the self-check then dressed up as an
+    algorithm drift. The body is the evidence; only its first line is kept,
+    because a stack trace has no business in a report people paste in public.
+    """
+    reason = (
+        "the tiktok signing page is no longer on tiktok.com "
+        "(it is on chrome-error://chromewebdata): a navigation after it loaded failed"
+    )
+
+    def refusing(request: httpx.Request) -> httpx.Response:
+        body = {"error": {"code": "backend_failed", "message": f"{reason}\n    at eval (<x>:1:1)"}}
+        return httpx.Response(502, json=body)
+
+    async with rpc_client(refusing) as client:
+        with pytest.raises(SigningFailed) as excinfo:
+            await RpcSigner(client, "http://rpc").sign(TIKTOK_SPEC, FINGERPRINT)
+
+    message = str(excinfo.value)
+    assert message.startswith("browser-rpc failed (HTTP 502 backend_failed): ")
+    assert reason in message
+    assert "unreachable" not in message
+    assert "at eval" not in message
+
+
+#: browser-rpc's answer for issue #830 through an identity's proxy, exactly as
+#: its service composes it now: the cause, the remedy, then the note on a
+#: failure both attempts shared. 379 characters.
+COMPOSED_830 = (
+    "could not warm a signing page for tiktok: the tiktok signing page is no longer on "
+    "tiktok.com (it is on chrome-error://chromewebdata): a navigation after it loaded failed "
+    "or was blocked - look at the exit it loads through (DTK_BROWSER_SIGN_PROXY_URL, the "
+    "identity's proxy, or this host); both attempts failed this way, on two different pages "
+    "through the same exit (identity_proxy)"
+)
+
+
+async def test_the_830_sentence_reaches_dtk_whole() -> None:
+    """At 300 characters the cut fell in the remedy: "look at the exit it lo".
+
+    So the list of exits to check reached neither the API error, nor the
+    signing.rpc.refused line, nor the self-check's reason.
+    """
+
+    def refusing(request: httpx.Request) -> httpx.Response:
+        body = {"error": {"code": "backend_failed", "message": COMPOSED_830}}
+        return httpx.Response(502, json=body)
+
+    async with rpc_client(refusing) as client:
+        with pytest.raises(SigningFailed) as excinfo:
+            await RpcSigner(client, "http://rpc").sign(TIKTOK_SPEC, FINGERPRINT)
+
+    assert str(excinfo.value) == f"browser-rpc failed (HTTP 502 backend_failed): {COMPOSED_830}"
+    assert "DTK_BROWSER_SIGN_PROXY_URL" in str(excinfo.value)
+
+
+async def test_an_overlong_reason_is_cut_at_a_word_and_says_so() -> None:
+    words = " ".join(f"word{index:03d}" for index in range(200))
+
+    def refusing(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, json={"error": {"code": "backend_failed", "message": words}})
+
+    async with rpc_client(refusing) as client:
+        with pytest.raises(SigningFailed) as excinfo:
+            await RpcSigner(client, "http://rpc").sign(TIKTOK_SPEC, FINGERPRINT)
+
+    kept = str(excinfo.value).removeprefix("browser-rpc failed (HTTP 502 backend_failed): ")
+    assert len(kept) <= RPC_ERROR_EXCERPT_CHARS
+    assert kept.endswith("...")
+    # Whole words only: what precedes the marker is one of the words sent.
+    assert kept.removesuffix("...").split(" ")[-1] in words.split(" ")
+    # And at the LAST word that fits, not somewhere well short of it.
+    assert len(kept) > RPC_ERROR_EXCERPT_CHARS - len("word000 ") - len("...")
+
+
+async def test_an_overlong_reason_that_is_not_prose_is_cut_where_it_is() -> None:
+    """A word boundary far back would throw most of the message away."""
+    blob = "Page.evaluate: " + "x" * 700
+
+    def refusing(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, json={"error": {"code": "backend_failed", "message": blob}})
+
+    async with rpc_client(refusing) as client:
+        with pytest.raises(SigningFailed) as excinfo:
+            await RpcSigner(client, "http://rpc").sign(TIKTOK_SPEC, FINGERPRINT)
+
+    kept = str(excinfo.value).removeprefix("browser-rpc failed (HTTP 502 backend_failed): ")
+    assert len(kept) == RPC_ERROR_EXCERPT_CHARS
+    assert kept.startswith("Page.evaluate: x")
+    assert kept.endswith("x...")
+
+
+@pytest.mark.parametrize(
+    ("error", "says"),
+    [
+        (httpx.ConnectError("refused"), "browser-rpc unreachable: ConnectError: refused"),
+        (httpx.ConnectTimeout(""), "browser-rpc unreachable: ConnectTimeout"),
+        # Up, and still working on its two attempts when this client gave up:
+        # "unreachable" sent operators to a container that was fine.
+        (httpx.ReadTimeout(""), "browser-rpc did not answer within 10s: ReadTimeout"),
+    ],
+)
+async def test_no_answer_says_which_kind_of_none(error: httpx.HTTPError, says: str) -> None:
+    def silent(request: httpx.Request) -> httpx.Response:
+        raise error
+
+    async with rpc_client(silent) as client:
+        with pytest.raises(SigningFailed) as excinfo:
+            await RpcSigner(client, "http://rpc").sign(DOUYIN_SPEC, FINGERPRINT)
+    assert str(excinfo.value) == says
+
+
+async def test_a_refusal_without_a_json_body_still_names_its_status() -> None:
+    def proxy_page(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text="<html><body>Bad Gateway</body></html>")
+
+    async with rpc_client(proxy_page) as client:
+        with pytest.raises(SigningFailed, match=r"^browser-rpc failed \(HTTP 502\)$"):
             await RpcSigner(client, "http://rpc").sign(DOUYIN_SPEC, FINGERPRINT)
 
 
@@ -2264,10 +2432,14 @@ async def test_shadow_bracket_absorbs_a_real_x_bogus_second_boundary(
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        # The browser signs during the round trip, after the clock has ticked.
+        # The browser signs during the round trip, after the clock has ticked,
+        # and under its page's own User-Agent - here the probe's - whatever
+        # the request names (#832).
         return httpx.Response(
             200,
-            json={"x_bogus": XBogus(body["user_agent"]).sign(body["query"], timestamp=1700000001)},
+            json={
+                "x_bogus": XBogus(FINGERPRINT.user_agent).sign(body["query"], timestamp=1700000001)
+            },
         )
 
     async with rpc_client(handler) as client:
@@ -2295,7 +2467,11 @@ async def test_shadow_agrees_with_a_browser_running_the_same_x_bogus() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        return httpx.Response(200, json={"x_bogus": XBogus(body["user_agent"]).sign(body["query"])})
+        # Under the page's own User-Agent, whatever the request names (#832);
+        # a page running the probe's, so the two can agree byte for byte.
+        return httpx.Response(
+            200, json={"x_bogus": XBogus(FINGERPRINT.user_agent).sign(body["query"])}
+        )
 
     async with rpc_client(handler) as client:
         registry = SignerRegistry(
@@ -2382,6 +2558,7 @@ async def test_shadow_skips_when_nothing_is_comparable() -> None:
     # Named, so an operator reading the self-check knows which parameter went
     # unjudged. "every parameter skipped" was true and unactionable.
     assert result.detail == "nothing comparable (msToken)"
+    assert result.skip is ShadowSkip.NOTHING_COMPARABLE
     assert registry.native_enabled(Platform.DOUYIN) is True
 
 
@@ -2428,6 +2605,7 @@ async def test_a_broken_reference_says_so_rather_than_blaming_the_signer() -> No
     detail = result.detail or ""
     assert "a_bogus" in detail
     assert "not an a_bogus" in detail and "check the browser" in detail
+    assert result.skip is ShadowSkip.REFERENCE_UNUSABLE
     # Nothing about the reference is a verdict on the signer.
     assert registry.native_enabled(Platform.DOUYIN) is True
 
@@ -2439,9 +2617,17 @@ async def test_shadow_skips_when_the_parameters_do_not_overlap() -> None:
     assert await registry.compare_shadow(DOUYIN_SPEC, FINGERPRINT) is True
     result = registry.shadow_result(Platform.DOUYIN, DOUYIN_SPEC.endpoint)
     assert result is not None and result.detail == "no comparable parameter"
+    assert result.skip is ShadowSkip.NOTHING_COMPARABLE
 
 
 async def test_shadow_skips_when_the_rpc_sample_fails() -> None:
+    """The browser failing to sign is a finding about the browser, and only that.
+
+    It used to be recorded as "sample failed: ..." - the same words a native
+    failure got - and the self-check read every skip as "the browser runs a
+    different version of the algorithm". In #830 the browser's page had left
+    tiktok.com; nothing about any algorithm had changed.
+    """
     native = FakeSigner(SIGNER_NATIVE)
     rpc = FakeSigner(SIGNER_BROWSER, fail=SigningFailed("browser down"))
     registry, _, _, _ = build_registry(native=native, rpc=rpc)
@@ -2449,8 +2635,47 @@ async def test_shadow_skips_when_the_rpc_sample_fails() -> None:
     result = registry.shadow_result(Platform.DOUYIN, DOUYIN_SPEC.endpoint)
     assert result is not None
     assert result.compared is False
-    assert "browser down" in (result.detail or "")
+    assert result.skip is ShadowSkip.REFERENCE_FAILED
+    assert result.error == "browser down"
+    assert result.detail == "browser reference failed: browser down"
     assert registry.native_enabled(Platform.DOUYIN) is True
+
+
+async def test_a_native_failure_is_not_pinned_on_the_browser() -> None:
+    """The opposite finding: the signer serving traffic is the one that broke."""
+    native = FakeSigner(SIGNER_NATIVE, fail=SigningFailed("a_bogus could not be computed"))
+    rpc = FakeSigner(SIGNER_BROWSER)
+    registry, _, _, _ = build_registry(native=native, rpc=rpc)
+    assert await registry.compare_shadow(DOUYIN_SPEC, FINGERPRINT) is True
+    result = registry.shadow_result(Platform.DOUYIN, DOUYIN_SPEC.endpoint)
+    assert result is not None and result.compared is False
+    assert result.skip is ShadowSkip.NATIVE_FAILED
+    assert result.error == "a_bogus could not be computed"
+    assert (result.detail or "").startswith("native signer failed: ")
+    # The browser was never asked: the sample stopped where it broke.
+    assert rpc.calls == 0
+
+
+async def test_a_native_failure_after_the_browser_signed_is_still_native() -> None:
+    """The second, bracketing native signature is the native side too."""
+    native = FakeSigner(SIGNER_NATIVE)
+    rpc = FakeSigner(SIGNER_BROWSER)
+    registry, _, _, _ = build_registry(native=native, rpc=rpc)
+
+    original = native.sign
+
+    async def fails_second_time(*args: Any, **kwargs: Any) -> SignedParams:
+        if native.calls >= 1:
+            native.calls += 1
+            raise SigningFailed("clock went backwards")
+        return await original(*args, **kwargs)
+
+    native.sign = fails_second_time  # type: ignore[method-assign]
+    await registry.compare_shadow(DOUYIN_SPEC, FINGERPRINT)
+    result = registry.shadow_result(Platform.DOUYIN, DOUYIN_SPEC.endpoint)
+    assert result is not None
+    assert result.skip is ShadowSkip.NATIVE_FAILED
+    assert rpc.calls == 1
 
 
 async def test_shadow_without_an_rpc_signer_does_not_disable_native() -> None:
@@ -2458,7 +2683,18 @@ async def test_shadow_without_an_rpc_signer_does_not_disable_native() -> None:
     assert await registry.compare_shadow(DOUYIN_SPEC, FINGERPRINT) is True
     result = registry.shadow_result(Platform.DOUYIN, DOUYIN_SPEC.endpoint)
     assert result is not None and result.compared is False
+    assert result.skip is ShadowSkip.NO_SECOND_SIGNER
     assert registry.native_enabled(Platform.DOUYIN) is True
+
+
+async def test_a_compared_sample_carries_no_skip() -> None:
+    native = FakeSigner(SIGNER_NATIVE, param="X-Bogus", value="same")
+    rpc = FakeSigner(SIGNER_BROWSER, param="X-Bogus", value="same")
+    registry, _, _, _ = build_registry(native=native, rpc=rpc)
+    assert await registry.compare_shadow(DOUYIN_SPEC, FINGERPRINT) is True
+    result = registry.shadow_result(Platform.DOUYIN, DOUYIN_SPEC.endpoint)
+    assert result is not None and result.compared is True
+    assert result.skip is None and result.error is None
 
 
 async def test_operator_can_disable_and_re_enable_native() -> None:
@@ -2680,6 +2916,374 @@ async def test_registry_reraises_when_the_fallback_is_also_unavailable() -> None
     assert rpc.calls == 0
 
 
+#: browser-rpc's answer to an identity whose User-Agent its page does not run.
+UA_MISMATCH_BODY = {
+    "error": {
+        "code": USER_AGENT_MISMATCH,
+        "message": "this browser signs tiktok requests as Chrome/146 on Windows and this "
+        "identity's is Chrome/145 on Windows: the platform seals the User-Agent into the "
+        "signature",
+    }
+}
+
+
+async def test_a_user_agent_refusal_is_told_apart_from_a_broken_browser() -> None:
+    """Issue #832: browser-rpc now refuses a User-Agent its page does not run, with 409.
+
+    The registry acts on that one refusal - it signs the identity natively - so
+    it has to be recognisable; every other refusal stays what it was.
+    """
+
+    def refusing(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json=UA_MISMATCH_BODY)
+
+    async with rpc_client(refusing) as client:
+        with pytest.raises(SigningFailed) as excinfo:
+            await RpcSigner(client, "http://rpc").sign(TIKTOK_SPEC, FINGERPRINT)
+    assert is_user_agent_mismatch(excinfo.value)
+    assert str(excinfo.value).startswith("browser-rpc failed (HTTP 409 user_agent_mismatch): ")
+
+    def failing(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, json={"error": {"code": "backend_failed", "message": "x"}})
+
+    async with rpc_client(failing) as client:
+        with pytest.raises(SigningFailed) as excinfo:
+            await RpcSigner(client, "http://rpc").sign(TIKTOK_SPEC, FINGERPRINT)
+    assert not is_user_agent_mismatch(excinfo.value)
+
+
+async def test_a_user_agent_refusal_is_not_logged_as_a_browser_failure(monkeypatch) -> None:
+    """#832 review: at WARNING under `signing.rpc.refused` - the name a
+    browser-rpc outage uses - it was a second line per request on every
+    foreign identity. The registry logs it, once per identity, by id."""
+    recorder = EventRecorder()
+    monkeypatch.setattr(rpc_module, "logger", recorder)
+
+    def refusing(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json=UA_MISMATCH_BODY)
+
+    async with rpc_client(refusing) as client:
+        with pytest.raises(SigningFailed):
+            await RpcSigner(client, "http://rpc").sign(
+                TIKTOK_SPEC, FINGERPRINT, SigningSession(identity_id="identity-a")
+            )
+
+    assert recorder.events == [
+        (
+            "debug:signing.rpc.user_agent_refused",
+            {"endpoint": TIKTOK_SPEC.endpoint, "identity_id": "identity-a"},
+        )
+    ]
+
+
+async def test_a_signature_under_another_user_agent_is_refused_here() -> None:
+    """The guard's first test: it could not fire while browser-rpc echoed the
+    request's own User-Agent back (#832); against a service from before the
+    refusal, an honest answer naming another UA is still caught here."""
+
+    def answering(agent: str) -> Callable[[httpx.Request], httpx.Response]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json={"params": {"X-Bogus": "1", "X-Gnarly": "GNA"}, "user_agent": agent}
+            )
+
+        return handler
+
+    async with rpc_client(answering(UA_EDGE122)) as client:
+        with pytest.raises(SigningFailed, match="different User-Agent") as excinfo:
+            await RpcSigner(client, "http://rpc").sign(TIKTOK_SPEC, FINGERPRINT)
+    assert is_user_agent_mismatch(excinfo.value)
+
+    async with rpc_client(answering(FINGERPRINT.user_agent)) as client:
+        assert await RpcSigner(client, "http://rpc").sign(TIKTOK_SPEC, FINGERPRINT)
+
+
+class EventRecorder:
+    """Stands in for a module's logger and keeps the events it was given."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+
+    def __getattr__(self, level: str) -> Callable[..., None]:
+        def record(event: str, **fields: Any) -> None:
+            self.events.append((f"{level}:{event}", fields))
+
+        return record
+
+
+def ua_refusal() -> SigningFailed:
+    return SigningFailed("browser-rpc failed (HTTP 409)", details={"cause": USER_AGENT_MISMATCH})
+
+
+#: A TikTok jar holding a token, so the native signer can cover its requests.
+TIKTOK_SESSION = SigningSession(
+    cookies={MS_TOKEN_PARAM: "t" * 152, "ttwid": "w"}, identity_id="identity-a"
+)
+
+
+def tiktok_registry(
+    rpc: FakeSigner,
+    *,
+    mode: SigningMode = "rpc",
+    policy: RegistryPolicy | None = None,
+    native: FakeSigner | None = None,
+    alerts: list[tuple[str, Mapping[str, object]]] | None = None,
+) -> tuple[SignerRegistry, FakeSigner]:
+    """`build_registry` for TikTok, the platform whose UA browser-rpc binds."""
+    native = native or FakeSigner(SIGNER_NATIVE, value="native-sig")
+    registry = SignerRegistry(
+        {Platform.TIKTOK: native},
+        rpc,
+        policy=replace(policy or RegistryPolicy(), mode=mode),
+        clock=FakeClock(),
+        on_alert=(lambda event, context: alerts.append((event, context)))
+        if alerts is not None
+        else None,
+    )
+    return registry, native
+
+
+async def test_an_identity_the_browser_cannot_sign_is_signed_natively() -> None:
+    """Issue #832: in rpc mode, a refused User-Agent goes to the native signer.
+
+    The native signer seals the identity's own User-Agent, measured to work
+    (Chrome 145 sealed and sent: a full profile), where the browser's
+    signature could only seal its own and be refused as risk control.
+    """
+    rpc = FakeSigner(SIGNER_BROWSER, fail=ua_refusal())
+    registry, native = tiktok_registry(rpc)
+    for _ in range(2):
+        signed = await registry.sign(TIKTOK_SPEC, FINGERPRINT, TIKTOK_SESSION)
+        assert signed.signer == SIGNER_NATIVE
+    assert rpc.calls == 2 and native.calls == 2
+
+
+@pytest.mark.parametrize(
+    "why", ["fallback_disabled", "native_disabled", "no_native", "not_a_ua_refusal"]
+)
+async def test_the_native_signer_is_not_reached_for_otherwise(why: str, monkeypatch) -> None:
+    recorder = EventRecorder()
+    monkeypatch.setattr(registry_module, "logger", recorder)
+    fail = SigningFailed("browser-rpc failed (HTTP 502)") if why == "not_a_ua_refusal" else None
+    rpc = FakeSigner(SIGNER_BROWSER, fail=fail or ua_refusal())
+    policy = RegistryPolicy(fallback_enabled=why != "fallback_disabled")
+    if why == "no_native":
+        registry = SignerRegistry({}, rpc, policy=replace(policy, mode="rpc"), clock=FakeClock())
+        native = FakeSigner(SIGNER_NATIVE, value="unused")
+    else:
+        registry, native = tiktok_registry(rpc, policy=policy)
+    if why == "native_disabled":
+        registry.disable_native(Platform.TIKTOK, reason="test")
+    with pytest.raises(SigningFailed) as excinfo:
+        await registry.sign(TIKTOK_SPEC, FINGERPRINT, TIKTOK_SESSION)
+    assert native.calls == 0
+    lines = [f for e, f in recorder.events if e == "warning:signing.rpc.user_agent_mismatch"]
+    if why == "not_a_ua_refusal":
+        assert not is_user_agent_mismatch(excinfo.value)
+        assert lines == []
+        return
+    # The cause the SIGNING_FAILED message renders from, and the line the
+    # troubleshooting guide sends the operator to, with the reason in it.
+    assert is_user_agent_mismatch(excinfo.value)
+    [line] = lines
+    assert line["signer"] is None and line["not_native"] == why
+
+
+async def test_a_ua_refusal_is_logged_again_when_its_outcome_changes(monkeypatch) -> None:
+    """#832 review: an identity first served natively, then failed because its
+    jar lost its token, used to fail in silence - the line was keyed on the
+    identity alone, and the operator is sent to it to read why."""
+    recorder = EventRecorder()
+    monkeypatch.setattr(registry_module, "logger", recorder)
+    rpc = FakeSigner(SIGNER_BROWSER, fail=ua_refusal())
+    registry, _ = tiktok_registry(rpc)
+    tokenless = SigningSession(cookies={"ttwid": "w"}, identity_id=TIKTOK_SESSION.identity_id)
+
+    await registry.sign(TIKTOK_SPEC, FINGERPRINT, TIKTOK_SESSION)
+    await registry.sign(TIKTOK_SPEC, FINGERPRINT, TIKTOK_SESSION)
+    with pytest.raises(SigningFailed):
+        await registry.sign(TIKTOK_SPEC, FINGERPRINT, tokenless)
+    with pytest.raises(SigningFailed):
+        await registry.sign(TIKTOK_SPEC, FINGERPRINT, tokenless)
+
+    lines = [f for e, f in recorder.events if e == "warning:signing.rpc.user_agent_mismatch"]
+    assert [(line["signer"], line.get("not_native")) for line in lines] == [
+        (SIGNER_NATIVE, None),
+        (None, "protected"),
+    ]
+
+
+@pytest.mark.parametrize("mode", ["rpc", "auto"])
+async def test_a_request_only_a_browser_can_sign_is_not_handed_to_native(
+    mode: SigningMode, monkeypatch
+) -> None:
+    """#832 review. A TikTok jar with no msToken is sent to the browser because
+    the native signer cannot cover it: signed natively it was refused 2/2 live
+    on 2026-11-20, where the same jar with its token answered 2/2. Handing it
+    to native on a User-Agent refusal turned a dtk-side cause into a platform
+    refusal - risk control, which cools and degrades the identity. The refusal
+    is raised instead: a signing failure, with its cause."""
+    recorder = EventRecorder()
+    monkeypatch.setattr(registry_module, "logger", recorder)
+    rpc = FakeSigner(SIGNER_BROWSER, fail=ua_refusal())
+    registry, native = tiktok_registry(rpc, mode=mode)
+    tokenless = SigningSession(cookies={"ttwid": "w"}, identity_id="identity-b")
+
+    with pytest.raises(SigningFailed) as excinfo:
+        await registry.sign(TIKTOK_SPEC, FINGERPRINT, tokenless)
+
+    assert is_user_agent_mismatch(excinfo.value)
+    assert rpc.calls == 1 and native.calls == 0
+    # The request fails, so the line that names the identity says why native
+    # did not take it.
+    [line] = [f for e, f in recorder.events if e == "warning:signing.rpc.user_agent_mismatch"]
+    assert line["identity_id"] == "identity-b"
+    assert line["signer"] is None and line["not_native"] == "protected"
+
+
+async def test_a_ua_refusal_is_logged_once_per_identity_by_id(monkeypatch) -> None:
+    """#832 review: the operator's question is which identities the browser
+    cannot sign, so the line names each one - once, not per request."""
+    recorder = EventRecorder()
+    monkeypatch.setattr(registry_module, "logger", recorder)
+    rpc = FakeSigner(SIGNER_BROWSER, fail=ua_refusal())
+    registry, _ = tiktok_registry(rpc)
+    other = replace(TIKTOK_SESSION, identity_id="identity-c")
+
+    for session in (TIKTOK_SESSION, TIKTOK_SESSION, other, TIKTOK_SESSION):
+        await registry.sign(TIKTOK_SPEC, FINGERPRINT, session)
+
+    named = [
+        fields["identity_id"]
+        for event, fields in recorder.events
+        if event == "warning:signing.rpc.user_agent_mismatch"
+    ]
+    assert named == ["identity-a", "identity-c"]
+
+
+async def test_crossing_to_native_on_a_ua_refusal_is_announced_once(monkeypatch) -> None:
+    """#832 review. In rpc mode native is the signer the operator chose
+    against, and every crossing to it is alerted, once per endpoint - this one
+    too. Not through `_cross`, whose release on the next browser-signed
+    request would re-alert on every other request of a mixed pool."""
+    alerts: list[tuple[str, Mapping[str, object]]] = []
+    refused = SigningFailed("browser-rpc failed (HTTP 409)", details={"cause": USER_AGENT_MISMATCH})
+
+    class MixedPool(FakeSigner):
+        """Refuses identity-a's User-Agent, signs everybody else."""
+
+        async def sign(
+            self,
+            spec: RequestSpec,
+            identity_fingerprint: SigningFingerprint,
+            session: SigningSession | None = None,
+        ) -> SignedParams:
+            self.fail = refused if session and session.identity_id == "identity-a" else None
+            return await super().sign(spec, identity_fingerprint, session)
+
+    rpc = MixedPool(SIGNER_BROWSER)
+    registry, _ = tiktok_registry(rpc, alerts=alerts)
+    other = replace(TIKTOK_SESSION, identity_id="identity-d")
+
+    signers = [
+        (await registry.sign(TIKTOK_SPEC, FINGERPRINT, session)).signer
+        for session in (TIKTOK_SESSION, other, TIKTOK_SESSION, other)
+    ]
+
+    assert signers == [SIGNER_NATIVE, SIGNER_BROWSER, SIGNER_NATIVE, SIGNER_BROWSER]
+    assert alerts == [
+        (
+            "signing.fallback.engaged",
+            {
+                "platform": "tiktok",
+                "endpoint": TIKTOK_SPEC.endpoint,
+                "signer": SIGNER_NATIVE,
+                "reason": "browser-rpc cannot sign under this identity's User-Agent",
+            },
+        )
+    ]
+
+
+async def test_in_auto_mode_native_on_a_ua_refusal_is_no_crossing() -> None:
+    """In auto mode native is the preferred signer; signing with it is not a
+    fallback to announce."""
+    alerts: list[tuple[str, Mapping[str, object]]] = []
+    rpc = FakeSigner(SIGNER_BROWSER, fail=ua_refusal())
+    registry, _ = tiktok_registry(rpc, mode="auto", alerts=alerts)
+    # At risk, so auto crosses to the browser for a jar native could sign.
+    for _ in range(30):
+        registry.observe(Platform.TIKTOK, TIKTOK_SPEC.endpoint, Outcome.RISK_CONTROL)
+
+    signed = await registry.sign(TIKTOK_SPEC, FINGERPRINT, TIKTOK_SESSION)
+
+    assert signed.signer == SIGNER_NATIVE and rpc.calls == 1
+    assert [context["signer"] for _, context in alerts] == [SIGNER_BROWSER]
+
+
+async def test_a_douyin_signature_under_the_pages_own_user_agent_is_used() -> None:
+    """#832 review. Douyin accepted a page's signature for identities on other
+    Chrome majors and Edge (measured 2026-11-20), and browser-rpc refuses the
+    one case it did not - another operating system - itself. So an answer that
+    honestly names the page's own, different User-Agent is used, not refused
+    on this side as it is for TikTok."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"params": {"a_bogus": "AB", "msToken": "m"}, "user_agent": UA_EDGE122}
+        )
+
+    async with rpc_client(handler) as client:
+        signed = await RpcSigner(client, "http://rpc").sign(DOUYIN_SPEC, FINGERPRINT)
+
+    assert signed.signer == SIGNER_BROWSER
+    assert "a_bogus=AB" in signed.query
+
+
+async def test_a_native_failure_is_not_hidden_behind_a_ua_refusal() -> None:
+    """Native raised, and the browser cannot sign this identity at all: the
+    native signer's error is the one that says what is wrong."""
+    native = FakeSigner(SIGNER_NATIVE, fail=SigningFailed("algorithm blew up"))
+    rpc = FakeSigner(SIGNER_BROWSER, fail=ua_refusal())
+    registry, _ = tiktok_registry(rpc, native=native, mode="native")
+    with pytest.raises(SigningFailed, match="blew up"):
+        await registry.sign(TIKTOK_SPEC, FINGERPRINT, TIKTOK_SESSION)
+    assert rpc.calls == 1
+
+
+class AgentBoundBrowser(FakeSigner):
+    """browser-rpc as it is now: it refuses a User-Agent its page does not run."""
+
+    def __init__(self) -> None:
+        super().__init__(SIGNER_BROWSER, value="native-sig")
+        self.agents: list[str] = []
+
+    async def sign(
+        self,
+        spec: RequestSpec,
+        identity_fingerprint: SigningFingerprint,
+        session: SigningSession | None = None,
+    ) -> SignedParams:
+        self.agents.append(identity_fingerprint.user_agent)
+        if identity_fingerprint.user_agent:
+            raise ua_refusal()
+        return await super().sign(spec, identity_fingerprint, session)
+
+
+async def test_the_shadow_reference_is_taken_under_the_browsers_own_user_agent() -> None:
+    """Issue #832. The browser never signed under any other: its page runs one,
+    whatever it is asked, which the comparators were built around. It now
+    refuses to be asked for another, and the self-check probes with a fixed
+    Chrome 130 no page runs - so asking for it would fail every sample."""
+    rpc = AgentBoundBrowser()
+    registry, native, _, _ = build_registry(rpc=rpc)
+    assert await registry.compare_shadow(DOUYIN_SPEC, FINGERPRINT) is True
+
+    result = registry.shadow_result(Platform.DOUYIN, DOUYIN_SPEC.endpoint)
+    assert result is not None and result.skip is not ShadowSkip.REFERENCE_FAILED
+    assert rpc.agents == [""]
+    assert native.calls == 2
+
+
 async def test_shadow_skips_a_parameter_with_no_comparator() -> None:
     native = FakeSigner(SIGNER_NATIVE, param="future_sig", value="a")
     rpc = FakeSigner(SIGNER_BROWSER, param="future_sig", value="b")
@@ -2816,6 +3420,31 @@ TIKTOK_UA_LINUX = (
 #: prove the algorithm, and only a real capture can prove the constants.
 HARNESS_ENV_CODE: Final = 129
 HARNESS_UB_CODE: Final = 14
+
+#: The build the Node harness ran, which the vectors carry inside their seals.
+#: The module has moved on to 2.0.0.569; these stay, because what they prove -
+#: the algorithm - did not move with it. Pinned to a real 561 capture below, so
+#: this is a fact about that bundle and not a number copied from the old port.
+HARNESS_BUILD: Final = tiktok_sign.SdkBuild("5.3.2", "2.0.0.561", 0xC46CE353)
+
+#: A 2.0.0.569 X-Dynosaur from browser-rpc's own page (CloakBrowser 0.6.3,
+#: Chromium 146, 2026-11-20), and the synthetic item_list query it covers.
+#: Taken from an anonymous page - no jar, so no session value in it - that had
+#: been open for minutes: a page in its first seconds seals hash_state("")
+#: where the build's state hash belongs. Inline like the 561 capture further
+#: down, because the fixture scrubber rightly refuses opaque strings it cannot
+#: prove harmless.
+BUILD_569_QUERY: Final = (
+    "aid=1988&count=30&cursor=0&device_platform=web_pc&secUid=dtk-fixture-placeholder"
+)
+BUILD_569_CAPTURE: Final = (
+    "MFlTM1WsF2bo2RDltsOApwywtAvbbX/nACR85nFo7PYJa/OQllo68vjLGA9MS8dXheXrNFROGWqt"
+    "Yjv4s/EVo9EV8SXM0L9ROQpe2vRXBtedI4dF5aQIAXcQyXgNLgaV3ttBVBcyXP8489fz1s7mOYWm"
+    "8ceEcljU9aLbW3DWzzlisvV8LzUr0zOPbbkXvVmSyvg5zkxbEyaIGxTR/8x3/EyYPvG199apJcDc"
+    "koXJt4U8ZyywcWTnsY/6kMHPZJ0Aq8U/SVG8l/f2DsJEijkr69t3XsfU673aLLFNSgI7TsQFmJih"
+    "REuN5fbCDUgDB4Nlm5Tts/aUqlLcyf4Y9gbS93lCUEd/-HZP2aaJbHoLsz9ulQCsNdy8nD1N6jrt"
+    "VBzAKw-umfFsW5Uo5MD3UGyHkmMwkZ82DqlM5pMuObEAXwDxuhHjePDdPAT2xQxVOQEoHsfnLZ=="
+)
 
 TIKTOK_VECTORS: list[dict[str, object]] = [
     {
@@ -3189,6 +3818,7 @@ class TestTikTokSignature:
             sequence=cast(int, vector["sequence"]),
             env_code=HARNESS_ENV_CODE,
             ub_code=HARNESS_UB_CODE,
+            build=HARNESS_BUILD,
         )
         return tiktok_sign.seal(payload, cast("Sequence[int]", vector["dynosaur_key"]))
 
@@ -3211,6 +3841,7 @@ class TestTikTokSignature:
             order=cast("Sequence[int]", vector["gnarly_order"]),
             env_code=HARNESS_ENV_CODE,
             ub_code=HARNESS_UB_CODE,
+            build=HARNESS_BUILD,
         )
         return tiktok_sign.seal(payload, cast("Sequence[int]", vector["gnarly_key"]))
 
@@ -3247,10 +3878,43 @@ class TestTikTokSignature:
 
         assert int(decode(fields[0x26], tiktok_sign.ENCODER_A)) == tiktok_sign.ENV_CODE
         assert int(decode(fields[0x36], tiktok_sign.ENCODER_A)) == tiktok_sign.UB_CODE
-        # The same capture pins the three version-ish constants beside them.
+        # It used to pin the build constants beside them as well. It is a 2.0.0.561
+        # capture, so now it pins the harness's build instead - the one the
+        # vectors above were sealed under - and the shipped build is pinned by
+        # the 2.0.0.569 capture in the next test. One capture cannot do both:
+        # the 569 one reports ub_code 14, which item_list refuses.
+        assert decode(fields[0x2A], tiktok_sign.ENCODER_A) == HARNESS_BUILD.sdk_version
+        assert decode(fields[0x31], tiktok_sign.ENCODER_A) == HARNESS_BUILD.scm_version
+        assert int.from_bytes(fields[0x38], "big") == HARNESS_BUILD.vm_state_hash
+
+    def test_the_shipped_build_matches_a_2_0_0_569_capture(self) -> None:
+        """The bundle moved under a port that kept working, and only a capture says so.
+
+        tiktok.com began serving webmssdk 2.0.0.569 while this module still
+        stamped 2.0.0.561 into every signature. TikTok accepted it - it accepted
+        "9.9.9" too, on 2026-11-20 - and the shadow comparison reported "match",
+        because its only TikTok verdict was X-Bogus, the constant "1" on both
+        sides. It compares the build now (TestTikTokShadowVerdicts), against a
+        browser; this pins the shipped build against a capture.
+        """
+        token = BUILD_569_CAPTURE
+        payload, _ = tiktok_sign.unseal(token)
+        fields = tiktok_sign.unpack_payload(payload)
+        decode = tiktok_sign.decode_field
+
         assert decode(fields[0x2A], tiktok_sign.ENCODER_A) == tiktok_sign.SDK_VERSION
         assert decode(fields[0x31], tiktok_sign.ENCODER_A) == tiktok_sign.SCM_VERSION
         assert int.from_bytes(fields[0x38], "big") == tiktok_sign.VM_STATE_HASH
+        # Over the query it says it covers, so it is that request's signature.
+        query = BUILD_569_QUERY
+        assert int.from_bytes(fields[0x2E], "big") == tiktok_sign.hash_state(query)
+        # The same field table as the port emits: what moved was data, not shape.
+        ours = tiktok_sign.unpack_payload(
+            tiktok_sign.dynosaur_payload(query, "UA", timestamp=1, nonce=1)
+        )
+        assert sorted(fields) == sorted(ours)
+        # And not where the two codes come from: a page nobody touched says 14.
+        assert decode(fields[0x36], tiktok_sign.ENCODER_A) == "14" != str(tiktok_sign.UB_CODE)
 
     def test_unseal_recovers_what_seal_produced(self) -> None:
         """The envelope is invertible, which is what makes the capture readable."""
@@ -3398,9 +4062,16 @@ class TestTikTokSignature:
         assert first != again
 
     def test_the_versions_it_reports_are_the_bundle_it_was_read_from(self) -> None:
-        """A bundle bump changes these, and a stale port looks like an outage."""
-        assert tiktok_sign.SDK_VERSION == "5.3.2"
-        assert tiktok_sign.SCM_VERSION == "2.0.0.561"
+        """A bundle bump changes these, and nothing at runtime notices a stale one."""
+        assert tiktok_sign.SDK_VERSION == "5.3.3"
+        assert tiktok_sign.SCM_VERSION == "2.0.0.569"
+        assert tiktok_sign.VM_STATE_HASH == 0xF3237B02
+        build = tiktok_sign.CURRENT_BUILD
+        assert (build.sdk_version, build.scm_version, build.vm_state_hash) == (
+            "5.3.3",
+            "2.0.0.569",
+            0xF3237B02,
+        )
 
     def test_the_url_state_hash_matches_the_sdks(self) -> None:
         """FNV-1a with an extra ``* 33``; three payload fields depend on it."""
@@ -3503,3 +4174,134 @@ class TestNativeSignerOnTikTok:
     async def test_it_no_longer_computes_a_sixteen_character_x_bogus(self):
         signed = await self._sign({"aid": "1988"})
         assert signed.params["X-Bogus"] == "1"
+
+
+# --------------------------------------------------------------------------
+# registry: what a TikTok shadow sample can judge
+# --------------------------------------------------------------------------
+
+
+def dynosaur_of(build: tiktok_sign.SdkBuild) -> str:
+    """A real X-Dynosaur that names ``build``, sealed under a fixed key."""
+    payload = tiktok_sign.dynosaur_payload(
+        BUILD_569_QUERY, "UA", timestamp=1_700_000_000, nonce=7, build=build
+    )
+    return tiktok_sign.seal(payload, tuple(range(1, 13)))
+
+
+class TestTikTokShadowVerdicts:
+    """TikTok's only verdict was X-Bogus, the constant "1" on both sides.
+
+    So the self-check passed TikTok as "native and browser signatures agree"
+    while the native signer stamped a webmssdk build tiktok.com had stopped
+    serving. X-Dynosaur names its build, and that is what both signers can be
+    held to.
+    """
+
+    def test_the_build_reads_out_of_a_real_capture(self) -> None:
+        assert tiktok_sign.read_build(BUILD_569_CAPTURE) == tiktok_sign.CURRENT_BUILD
+        assert tiktok_sign.read_build(dynosaur_of(HARNESS_BUILD)) == HARNESS_BUILD
+
+    def test_the_vestigial_x_bogus_is_not_a_verdict(self) -> None:
+        assert XBogusComparator().compare("1", "1") is Comparison.SKIPPED
+        # The platform computing a real one again is a change worth seeing.
+        assert XBogusComparator().compare("1", "DFSzswVOAATANH89") is Comparison.MISMATCH
+        assert XBogusComparator().compare("DFSz", "DFSz") is Comparison.MATCH
+
+    @pytest.mark.parametrize(
+        ("remote", "verdict"),
+        [
+            (BUILD_569_CAPTURE, Comparison.MATCH),
+            (dynosaur_of(tiktok_sign.CURRENT_BUILD), Comparison.MATCH),
+            (dynosaur_of(HARNESS_BUILD), Comparison.DRIFT),
+            (
+                dynosaur_of(replace(tiktok_sign.CURRENT_BUILD, vm_state_hash=0x12345678)),
+                Comparison.DRIFT,
+            ),
+            # A page in its first seconds seals hash_state("") there.
+            (
+                dynosaur_of(
+                    replace(
+                        tiktok_sign.CURRENT_BUILD,
+                        vm_state_hash=tiktok_sign.UNSETTLED_STATE_HASH,
+                    )
+                ),
+                Comparison.MATCH,
+            ),
+            # An unsettled page excuses the state hash only: its versions must
+            # still be ours, or a newer build sealed before it settled passes.
+            (
+                dynosaur_of(
+                    replace(
+                        tiktok_sign.CURRENT_BUILD,
+                        scm_version="2.0.0.570",
+                        vm_state_hash=tiktok_sign.UNSETTLED_STATE_HASH,
+                    )
+                ),
+                Comparison.DRIFT,
+            ),
+            # Each version on its own counts.
+            (
+                dynosaur_of(replace(tiktok_sign.CURRENT_BUILD, sdk_version="5.3.4")),
+                Comparison.DRIFT,
+            ),
+            (
+                dynosaur_of(replace(tiktok_sign.CURRENT_BUILD, scm_version="2.0.0.570")),
+                Comparison.DRIFT,
+            ),
+            # Not an envelope at all: the reference failed, nothing is judged.
+            ("1", Comparison.SKIPPED),
+        ],
+    )
+    def test_the_build_comparator(self, remote: str, verdict: Comparison) -> None:
+        native = dynosaur_of(tiktok_sign.CURRENT_BUILD)
+        assert SdkBuildComparator().compare(native, remote) is verdict
+
+    def test_a_native_value_its_own_reader_rejects_is_a_mismatch(self) -> None:
+        assert SdkBuildComparator().compare("1", BUILD_569_CAPTURE) is Comparison.MISMATCH
+
+    @staticmethod
+    def _browser_answering(dynosaur: str) -> Callable[[httpx.Request], httpx.Response]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            params = {
+                "X-Dynosaur": dynosaur,
+                "msToken": body["params"].get("msToken", ""),
+                "X-Bogus": "1",
+                "X-Gnarly": "GNARLY",
+            }
+            return httpx.Response(200, json=params)
+
+        return handler
+
+    async def test_a_drifted_build_is_reported_and_never_switches(self) -> None:
+        handler = self._browser_answering(dynosaur_of(HARNESS_BUILD))
+        async with rpc_client(handler) as client:
+            registry = SignerRegistry(native_signers(), RpcSigner(client, "http://rpc"))
+            assert await registry.compare_shadow(TIKTOK_SPEC, FINGERPRINT) is True
+
+        result = registry.shadow_result(Platform.TIKTOK, TIKTOK_SPEC.endpoint)
+        assert result is not None
+        assert (result.compared, result.matched) == (True, True)
+        assert result.verdicts["X-Dynosaur"] is Comparison.DRIFT
+        assert result.verdicts["X-Bogus"] is Comparison.SKIPPED
+        assert result.detail == (
+            "X-Dynosaur: the browser signs as webmssdk 2.0.0.561 (sdkVersion 5.3.2, "
+            "state 0xC46CE353), the native signer as webmssdk 2.0.0.569 (sdkVersion 5.3.3, "
+            "state 0xF3237B02)"
+        )
+        # Reported, not acted on: browser-rpc's own item_list signatures are
+        # refused, so a switch would turn a stale stamp into an outage.
+        assert registry.native_enabled(Platform.TIKTOK) is True
+
+    async def test_the_same_build_is_a_real_match(self) -> None:
+        handler = self._browser_answering(BUILD_569_CAPTURE)
+        async with rpc_client(handler) as client:
+            registry = SignerRegistry(native_signers(), RpcSigner(client, "http://rpc"))
+            assert await registry.compare_shadow(TIKTOK_SPEC, FINGERPRINT) is True
+
+        result = registry.shadow_result(Platform.TIKTOK, TIKTOK_SPEC.endpoint)
+        assert result is not None
+        assert (result.compared, result.matched, result.detail) == (True, True, None)
+        assert result.verdicts["X-Dynosaur"] is Comparison.MATCH
+        assert result.verdicts["X-Bogus"] is Comparison.SKIPPED

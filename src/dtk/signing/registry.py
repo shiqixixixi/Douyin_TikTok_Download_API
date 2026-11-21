@@ -42,6 +42,14 @@ produce a permanent switch on the first sample:
   browser behind browser-rpc has its own.
 * **msToken** is per-identity. Not compared - and pinned before sampling, see
   :data:`SHADOW_MS_TOKEN`, so both signers sign the same bytes.
+* **X-Dynosaur** seals a per-call key and clock, so no two agree byte for byte,
+  but it names the webmssdk build that signed it, and both sides must name the
+  one tiktok.com serves. A different build is :attr:`Comparison.DRIFT`:
+  reported, never switched on - see :class:`SdkBuildComparator`.
+* TikTok's **X-Bogus** is the constant ``1`` on both sides and is not compared;
+  until X-Dynosaur was, a match on it was TikTok's only verdict, and the
+  self-check reported "native and browser signatures agree" on the strength of
+  a constant.
 
 A sample where nothing was comparable is reported as "not compared" rather than
 as a match; :meth:`SignerRegistry.compare_shadow` still returns ``True`` there,
@@ -50,6 +58,7 @@ because absence of evidence must never disable the native path.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping, MutableMapping
@@ -70,11 +79,19 @@ from dtk.signing.base import (
     SignerHealth,
     SigningFingerprint,
     SigningSession,
+    StaticFingerprint,
     endpoint_of,
     platform_of,
 )
 from dtk.signing.native.abogus import is_decode_problem, structure_error
+from dtk.signing.native.tiktok_sign import (
+    DYNOSAUR_PARAM,
+    UNSETTLED_STATE_HASH,
+    SdkBuild,
+    read_build,
+)
 from dtk.signing.protection import requires_browser_signature as signed_by_platform
+from dtk.signing.rpc import is_user_agent_mismatch
 
 logger = get_logger(__name__)
 
@@ -99,6 +116,14 @@ class Comparison(StrEnum):
     MATCH = "match"
     MISMATCH = "mismatch"
     SKIPPED = "skipped"
+    #: The same algorithm, stamped as a different build of the platform's SDK.
+    #: Reported and never acted on: a MISMATCH moves the platform onto
+    #: browser-rpc, and for TikTok that is the wrong answer to a build bump -
+    #: tiktok.com accepted the previous build's signatures (and invented ones)
+    #: when it was measured, while browser-rpc's own item_list signatures are
+    #: refused for their ub_code. Switching would trade a fingerprint tell for
+    #: an outage.
+    DRIFT = "drift"
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +203,96 @@ class SkipComparator:
 
     def compare(self, native: str, remote: str) -> Comparison:
         return Comparison.SKIPPED
+
+
+class XBogusComparator(ExactComparator):
+    """Exact, except where X-Bogus is TikTok's vestigial one-character marker.
+
+    On TikTok's HTTP requests X-Bogus is the literal ``1`` from both signers, so
+    an exact comparison of it always agreed and said nothing about either. It
+    was TikTok's only verdict, and the self-check passed TikTok as "native and
+    browser signatures agree" through the 2.0.0.561 -> 569 bundle bump that
+    neither side's X-Bogus could see. A real X-Bogus against the marker is
+    still a mismatch: the platform computing it again is a change worth seeing.
+    """
+
+    def compare(self, native: str, remote: str) -> Comparison:
+        if native == remote and len(native) <= 1:
+            return Comparison.SKIPPED
+        return super().compare(native, remote)
+
+
+class SdkBuildComparator:
+    """X-Dynosaur: do both signers stamp the same webmssdk build?
+
+    The seal carries a per-call key, a clock and a nonce, so two X-Dynosaurs of
+    one request never agree byte for byte - but the payload names the build that
+    produced it, and the browser's names the build tiktok.com is serving right
+    now. That is the drift that happened unseen: the page moved to 2.0.0.569
+    while the native signer kept stamping 2.0.0.561, and nothing at runtime
+    noticed (see :data:`dtk.signing.native.tiktok_sign.SDK_VERSION`).
+
+    A build that differs is :attr:`Comparison.DRIFT`, not a mismatch; the enum
+    says why. A browser page in its first seconds seals the empty-string state
+    hash where the build's belongs, so that one value is not held against us.
+    """
+
+    def compare(self, native: str, remote: str) -> Comparison:
+        try:
+            ours = read_build(native)
+        except ValueError as exc:
+            # Ours, generated and read back by the same module: a value we
+            # cannot read is a fault in this process, as with A-Bogus.
+            logger.error(
+                "signing.shadow.x_dynosaur_native_malformed",
+                problem=str(exc),
+                detail="the native signer produced an X-Dynosaur its own reader rejects",
+            )
+            return Comparison.MISMATCH
+        try:
+            theirs = read_build(remote)
+        except ValueError as exc:
+            # A browser-rpc that returned garbage, or an envelope TikTok has
+            # changed; this cannot tell which, so it judges nothing.
+            logger.warning(
+                "signing.shadow.x_dynosaur_remote_unusable",
+                problem=str(exc),
+                detail="browser-rpc returned a value this envelope does not open",
+            )
+            return Comparison.SKIPPED
+        return Comparison.MATCH if same_build(ours, theirs) else Comparison.DRIFT
+
+    @staticmethod
+    def explain(native: str, remote: str) -> str:
+        """The two builds, for the record of a drift. Version strings only."""
+        return (
+            f"the browser signs as {describe_build(read_build(remote))}, "
+            f"the native signer as {describe_build(read_build(native))}"
+        )
+
+
+def _any_agent(fingerprint: SigningFingerprint) -> StaticFingerprint:
+    """``fingerprint`` naming no User-Agent: browser-rpc then signs under its page's."""
+    return StaticFingerprint(
+        user_agent="",
+        browser_platform=fingerprint.browser_platform,
+        screen_width=fingerprint.screen_width,
+        screen_height=fingerprint.screen_height,
+    )
+
+
+def same_build(ours: SdkBuild, theirs: SdkBuild) -> bool:
+    """Whether two builds agree, not counting a page that had not settled."""
+    if (ours.sdk_version, ours.scm_version) != (theirs.sdk_version, theirs.scm_version):
+        return False
+    return theirs.vm_state_hash in (ours.vm_state_hash, UNSETTLED_STATE_HASH)
+
+
+def describe_build(build: SdkBuild) -> str:
+    return (
+        f"webmssdk {build.scm_version} (sdkVersion {build.sdk_version}, "
+        f"state 0x{build.vm_state_hash:08X})"
+    )
 
 
 class ABogusComparator:
@@ -307,8 +422,9 @@ class ABogusComparator:
 #: anything either signer computes.
 DEFAULT_COMPARATORS: Mapping[str, SignatureComparator] = {
     SignatureAlgorithm.A_BOGUS.value: ABogusComparator(),
-    SignatureAlgorithm.X_BOGUS.value: ExactComparator(),
+    SignatureAlgorithm.X_BOGUS.value: XBogusComparator(),
     SignatureAlgorithm.SIGNATURE.value: SkipComparator(),
+    DYNOSAUR_PARAM: SdkBuildComparator(),
     "msToken": SkipComparator(),
 }
 
@@ -369,6 +485,38 @@ class RegistryPolicy:
     health_ttl_seconds: float = 30.0
 
 
+class ShadowSkip(StrEnum):
+    """Why a shadow sample compared nothing. Each one points somewhere else.
+
+    A typed value rather than prose, because the self-check has to act on it.
+    It used to read every skip as one state - "sample failed: ..." or "nothing
+    comparable" alike - and attach a single paragraph saying the browser ran a
+    different version of the algorithm. In #830 the browser had simply failed
+    to sign (its page had left tiktok.com), and the operator was told to
+    re-derive invariants from a bundle that had not moved. A native failure and
+    a reference failure are opposite findings: one is the path serving
+    traffic, the other the yardstick.
+    """
+
+    #: No native signer or no browser-rpc for this platform.
+    NO_SECOND_SIGNER = "no_second_signer"
+    #: The native signer raised on the sample: the serving path is at fault.
+    NATIVE_FAILED = "native_failed"
+    #: browser-rpc raised: nothing was compared, and nothing is known about native.
+    REFERENCE_FAILED = "reference_failed"
+    #: browser-rpc answered with something that is not a signature at all.
+    REFERENCE_UNUSABLE = "reference_unusable"
+    #: Both signed, and no parameter they share has a comparator that judges it.
+    NOTHING_COMPARABLE = "nothing_comparable"
+
+
+#: The words a failed sample's detail starts with, per side.
+_SAMPLE_FAILURE_PREFIX: Mapping[ShadowSkip, str] = {
+    ShadowSkip.NATIVE_FAILED: "native signer failed",
+    ShadowSkip.REFERENCE_FAILED: "browser reference failed",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class ShadowResult:
     """One shadow sample, kept for the console and for tests."""
@@ -380,6 +528,10 @@ class ShadowResult:
     detail: str | None = None
     verdicts: Mapping[str, Comparison] = field(default_factory=dict)
     at: float = 0.0
+    #: Set exactly when ``compared`` is False.
+    skip: ShadowSkip | None = None
+    #: The failing signer's own message, for the two failure skips.
+    error: str | None = None
 
 
 class SignerRegistry:
@@ -419,6 +571,15 @@ class SignerRegistry:
         self._health: tuple[float, SignerHealth] | None = None
         self._last_shadow: dict[EndpointKey, ShadowResult] = {}
         self._shadow_seen: dict[EndpointKey, float] = {}
+        #: Identities already reported as ones browser-rpc cannot sign under,
+        #: with the digest of the User-Agent it refused and what became of the
+        #: request: the log names each once per outcome, because the operator's
+        #: questions are which ones they are and why one failed.
+        self._foreign_agents: set[tuple[Platform, str | None, str, str | None]] = set()
+        #: Endpoints whose requests have already crossed to the native signer
+        #: because browser-rpc refused an identity's User-Agent, so that
+        #: crossing is announced once - see `_native_for_a_foreign_agent`.
+        self._foreign_agent_crossings: set[EndpointKey] = set()
 
     @property
     def policy(self) -> RegistryPolicy:
@@ -438,22 +599,142 @@ class SignerRegistry:
     ) -> SignedParams:
         """Sign ``spec``, choosing the signer per the rules in the module docstring."""
         key = self._key(spec, platform, endpoint)
-        signer = await self._select(
-            key,
-            signed_by_platform(key[0], spec.url, session.cookies if session else None),
-        )
+        protected = signed_by_platform(key[0], spec.url, session.cookies if session else None)
+        signer = await self._select(key, protected)
         rpc = self._rpc_for(key[0])
         try:
             return await signer.sign(spec, identity_fingerprint, session)
         except DtkError as exc:
-            if signer is rpc or rpc is None:
+            if signer is rpc:
+                native = self._native_for_a_foreign_agent(
+                    key, exc, identity_fingerprint, session, protected=protected
+                )
+                if native is None:
+                    raise
+                return await native.sign(spec, identity_fingerprint, session)
+            if rpc is None:
                 raise
             logger.warning(
                 "signing.native.error", endpoint=key[1], platform=key[0].value, error=str(exc)
             )
             if not await self._rpc_healthy():
                 raise
-            return await rpc.sign(spec, identity_fingerprint, session)
+            try:
+                return await rpc.sign(spec, identity_fingerprint, session)
+            except DtkError as rpc_exc:
+                # The browser cannot sign for this identity at all, so the
+                # native signer's failure is the one that says what is wrong.
+                if is_user_agent_mismatch(rpc_exc):
+                    raise exc from rpc_exc
+                raise
+
+    def _native_for_a_foreign_agent(
+        self,
+        key: EndpointKey,
+        error: DtkError,
+        fingerprint: SigningFingerprint,
+        session: SigningSession | None,
+        *,
+        protected: bool,
+    ) -> Signer | None:
+        """The native signer, when browser-rpc refused this identity's User-Agent.
+
+        Issue #832. browser-rpc's page signs under its own User-Agent. TikTok
+        refuses a request whose header names another, and Douyin a browser
+        signature for a query naming another operating system, so such an
+        identity - minted under an older CloakBrowser, or imported from the
+        user's own browser - can never be signed there; browser-rpc now says
+        so instead of handing back a signature the platform refuses as risk
+        control. The native signer seals the identity's own User-Agent, which
+        was measured to work (2026-11-20: TikTok, Chrome 145 sealed and sent, a
+        full profile; Douyin, a macOS identity, 3/3). So that is who signs it -
+        when the policy lets the other signer be used and native is not
+        disabled.
+
+        And when native can cover the request at all. A ``protected`` one was
+        sent to the browser because only a browser can make its signature - a
+        TikTok jar with no msToken, a Douyin sign-protected endpoint and a jar
+        with no visitor id - and a native signature for it would come back as a
+        platform refusal (TikTok with no msToken: 0/2 natively on 2026-11-20,
+        where the same jar with its token answered 2/2): classified as risk
+        control, which cools and degrades an identity for a cause on this side.
+        The refusal is raised instead, as what it is - a signing failure that
+        cools nothing and names its cause.
+
+        Not a browser outage: rpc is not marked unhealthy and nothing reaches
+        the risk window. Each identity is logged once, by id, so the operator
+        can find the ones to replace; and in ``rpc`` mode, where native is the
+        signer the operator chose against, the crossing is announced once per
+        endpoint like every other.
+        """
+        if not is_user_agent_mismatch(error):
+            return None
+        platform = key[0]
+        native = self._native.get(platform)
+        blocked = self._why_not_native(platform, protected=protected)
+        identity_id = session.identity_id if session else None
+        agent = hashlib.sha256(fingerprint.user_agent.encode()).hexdigest()[:10]
+        # Once per identity per outcome, not once per identity: the reason
+        # native may not take it - a protected endpoint, a jar that lost its
+        # token, fallback switched off, native disabled - changes between
+        # requests and at runtime, and the line is where an operator is sent to
+        # read it. Keyed without the outcome, an identity first served natively
+        # then failed in silence (review of the #832 fix).
+        seen = (platform, identity_id, agent, blocked)
+        if seen not in self._foreign_agents:
+            self._foreign_agents.add(seen)
+            logger.warning(
+                "signing.rpc.user_agent_mismatch",
+                platform=platform.value,
+                endpoint=key[1],
+                identity_id=identity_id,
+                user_agent_sha=agent,
+                signer=native.name if native is not None and blocked is None else None,
+                **({"not_native": blocked} if blocked else {}),
+                detail=str(error),
+            )
+        if blocked is not None or native is None:
+            return None
+        if self.policy.mode == "rpc" and key not in self._foreign_agent_crossings:
+            # Not through `_cross`: the next request on this endpoint may be an
+            # identity the browser can sign, `_prefer` would then release the
+            # endpoint, and a pool mixing the two would alert on every other
+            # request.
+            self._foreign_agent_crossings.add(key)
+            why = "browser-rpc cannot sign under this identity's User-Agent"
+            logger.warning(
+                "signing.fallback.engaged",
+                platform=platform.value,
+                endpoint=key[1],
+                signer=native.name,
+                reason=why,
+            )
+            self._alert(
+                "signing.fallback.engaged",
+                {
+                    "platform": platform.value,
+                    "endpoint": key[1],
+                    "signer": native.name,
+                    "reason": why,
+                },
+            )
+        return native
+
+    def _why_not_native(self, platform: Platform, *, protected: bool) -> str | None:
+        """Why the native signer may not take a request browser-rpc refused; None if it may.
+
+        Named rather than just answered, because the request then fails and
+        the log line has to tell the operator which of these to change.
+        """
+        if protected:
+            return "protected"
+        if not self.policy.fallback_enabled:
+            return "fallback_disabled"
+        if platform not in self._native:
+            return "no_native"
+        if platform in self._native_disabled:
+            return "native_disabled"
+        return None
 
     def _rpc_for(self, platform: Platform) -> Signer | None:
         """browser-rpc, if it can sign for ``platform`` at all.
@@ -649,12 +930,20 @@ class SignerRegistry:
         native = self._native.get(key[0])
         rpc = self._rpc_for(key[0])
         if native is None or rpc is None:
-            return self._record_shadow(key, False, True, "no second signer to compare against")
+            return self._record_shadow(
+                key,
+                False,
+                True,
+                "no second signer to compare against",
+                skip=ShadowSkip.NO_SECOND_SIGNER,
+            )
 
         sample = self._shadow_spec(spec)
         detail: str | None = None
         verdicts: Mapping[str, Comparison] = {}
         for attempt in range(self.policy.shadow_retries + 1):
+            # Which side is signing, so a failure is pinned on the right one.
+            side = ShadowSkip.NATIVE_FAILED
             try:
                 # The remote call takes hundreds of milliseconds, and X-Bogus
                 # carries a whole-second timestamp. Bracketing it means the
@@ -665,23 +954,47 @@ class SignerRegistry:
                 # signs in a page loaded with this jar, and comparing against a
                 # signature taken in some other session would compare two
                 # different visitors and call the difference an algorithm drift.
-                remote_signed = await rpc.sign(sample, identity_fingerprint, session)
+                #
+                # But under the browser's own User-Agent, asked for by asking
+                # for none. Its page never signed under another - it runs one,
+                # whatever the request names - and the comparators judge only
+                # what the UA does not reach. It now refuses to be asked for
+                # one the platform would not accept (#832) - on TikTok any but
+                # its own - and the self-check probes with a fixed Chrome 130
+                # that no page runs.
+                side = ShadowSkip.REFERENCE_FAILED
+                remote_signed = await rpc.sign(sample, _any_agent(identity_fingerprint), session)
+                side = ShadowSkip.NATIVE_FAILED
                 after = await native.sign(sample, identity_fingerprint, session)
             except DtkError as exc:
-                return self._record_shadow(key, False, True, f"sample failed: {exc}")
+                return self._record_shadow(
+                    key,
+                    False,
+                    True,
+                    f"{_SAMPLE_FAILURE_PREFIX[side]}: {exc}",
+                    skip=side,
+                    error=str(exc),
+                )
 
             verdicts = self._compare((before, after), remote_signed)
             if not verdicts:
-                return self._record_shadow(key, False, True, "no comparable parameter")
+                return self._record_shadow(
+                    key, False, True, "no comparable parameter", skip=ShadowSkip.NOTHING_COMPARABLE
+                )
             if Comparison.MISMATCH not in verdicts.values():
+                drift = self._drift(before, remote_signed, verdicts)
+                if drift is not None:
+                    logger.error(
+                        "signing.shadow.drift", platform=key[0].value, endpoint=key[1], detail=drift
+                    )
+                    return self._record_shadow(key, True, True, drift, verdicts)
                 if Comparison.MATCH not in verdicts.values():
                     # Naming them, and why. "every parameter skipped" was true
                     # and told an operator nothing they could act on: which
                     # parameters, and whether this is a rule of ours that has
                     # gone stale or a signature nobody claims to compare.
-                    return self._record_shadow(
-                        key, False, True, self._skip_reason(remote_signed, verdicts), verdicts
-                    )
+                    skip, reason = self._skip_reason(remote_signed, verdicts)
+                    return self._record_shadow(key, False, True, reason, verdicts, skip=skip)
                 return self._record_shadow(key, True, True, None, verdicts)
             detail = ", ".join(
                 name for name, verdict in verdicts.items() if verdict is Comparison.MISMATCH
@@ -704,7 +1017,22 @@ class SignerRegistry:
         )
         return self._record_shadow(key, True, False, detail, verdicts)
 
-    def _skip_reason(self, remote: SignedParams, verdicts: Mapping[str, Comparison]) -> str:
+    def _drift(
+        self, native: SignedParams, remote: SignedParams, verdicts: Mapping[str, Comparison]
+    ) -> str | None:
+        """What drifted, in the comparators' own words; None when nothing did."""
+        found: list[str] = []
+        for name, verdict in verdicts.items():
+            if verdict is not Comparison.DRIFT:
+                continue
+            explain = getattr(self._comparators.get(name), "explain", None)
+            said = explain(native.params[name], remote.params[name]) if explain else None
+            found.append(f"{name}: {said}" if said else name)
+        return "; ".join(found) if found else None
+
+    def _skip_reason(
+        self, remote: SignedParams, verdicts: Mapping[str, Comparison]
+    ) -> tuple[ShadowSkip, str]:
         """Why nothing could be compared, in the words of the thing that skipped.
 
         The comparators return a verdict and not a reason, which is right for
@@ -729,12 +1057,12 @@ class SignerRegistry:
             alphabet = getattr(comparator, "alphabet", "s4")
             problem = structure_error(value, alphabet=alphabet)
             if problem is not None:
-                return (
+                return ShadowSkip.REFERENCE_UNUSABLE, (
                     f"nothing comparable ({names}): browser-rpc returned a value that is "
                     f"not an a_bogus ({problem}), so the sample had no reference to compare "
                     "against - check the browser, not the native signer"
                 )
-        return f"nothing comparable ({names})"
+        return ShadowSkip.NOTHING_COMPARABLE, f"nothing comparable ({names})"
 
     def _compare(
         self, natives: tuple[SignedParams, ...], remote: SignedParams
@@ -787,6 +1115,9 @@ class SignerRegistry:
         matched: bool,
         detail: str | None = None,
         verdicts: Mapping[str, Comparison] | None = None,
+        *,
+        skip: ShadowSkip | None = None,
+        error: str | None = None,
     ) -> bool:
         result = ShadowResult(
             platform=key[0],
@@ -796,13 +1127,21 @@ class SignerRegistry:
             detail=detail,
             verdicts=dict(verdicts or {}),
             at=self._clock(),
+            skip=skip,
+            error=error,
         )
         self._last_shadow[key] = result
         if not compared:
             logger.info(
-                "signing.shadow.skipped", platform=key[0].value, endpoint=key[1], reason=detail
+                "signing.shadow.skipped",
+                platform=key[0].value,
+                endpoint=key[1],
+                skip=skip.value if skip else None,
+                reason=detail,
             )
-        elif matched:
+        elif matched and Comparison.DRIFT not in result.verdicts.values():
+            # A drift has already been logged, at error level, by the caller;
+            # a "match" line after it read as the sample having been fine.
             logger.info("signing.shadow.match", platform=key[0].value, endpoint=key[1])
         return matched
 
@@ -878,9 +1217,12 @@ __all__ = [
     "RegistryPolicy",
     "RiskRateSource",
     "RiskSample",
+    "SdkBuildComparator",
     "ShadowResult",
+    "ShadowSkip",
     "SignatureComparator",
     "SignerRegistry",
     "SkipComparator",
     "SlidingRiskWindow",
+    "XBogusComparator",
 ]

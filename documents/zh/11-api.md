@@ -392,7 +392,7 @@ curl -sS "$DTK_BASE_URL/api/v1/parse?lang=zh" -X POST \
 | `INTERNAL` | 500 | **是** | 意料之外；报 bug 时请附上 `X-Request-ID` |
 | `UPSTREAM_RISK_CONTROL` | 502 | **是** | 平台判定该请求为自动化流量，相关身份进入冷却 |
 | `UPSTREAM_CHANGED` | 502 | 否 | 平台响应结构与解析器不再匹配，`details.path` 指出字段。请反馈 |
-| `SIGNING_FAILED` | 502 | **是** | 签名失败，算法可能已失效 |
+| `SIGNING_FAILED` | 502 | **是** | 签名失败，算法可能已失效。带 `details.cause: user_agent_mismatch` 时则不是：这个身份的 User-Agent 不是 browser-rpc 的，又没法原生签名——重试只有换到别的身份上才会成功；见[故障排查](./14-troubleshooting.md#api-和-worker-日志里的-browser-rpc-拒绝) |
 | `UPSTREAM_UNREACHABLE` | 502 | **是** | 每次尝试都在平台应答之前就在网络层失败了；`details.proxied` 说明最后一次有没有走代理。多半是这台机器的出网问题，不是平台 |
 | `IDENTITY_POOL_EXHAUSTED` | 503 | **是** | 没有可用身份；`retry_after` 是恢复时间的估计 |
 | `IDENTITY_LOGIN_REQUIRED` | 503 | 否 | 这个请求需要登录身份，而轮换里没有——抖音作者作品列表的后续页、B 站视频评论及回复的后续页，以及抖音作者喜欢列表的每一页。`details.cooling` 是正在冷却的登录身份数。靠导入一份来解决，重试没用；见[身份](./06-identities-and-proxies.md#哪些内容需要登录身份) |
@@ -455,6 +455,20 @@ curl -sS "$DTK_BASE_URL/api/v1/parse?lang=zh" -X POST \
 **`?refresh=true` 会同时关掉这两者。** 它忽略任何缓存的或在途的答案，重新去上游要一次。新答案仍然会被写入缓存——「别读缓存」和「别留下这份」是两个不同的请求，而你只提了第一个。它要真的花掉一个身份和一次上游请求，所以它是用来确认「有没有变」的，不是每次调用都该带的。
 
 这两套机制也解释了为什么同一个请求的两种写法会合并：`?url=https://www.douyin.com/video/7123…` 和 `?aweme_id=7123…` 会被提取成同样的参数，拿到同一个任务 ID。
+
+## 直接使用媒体链接
+
+`media.video.url`、`media.streams[].url` 这些是平台自己签过名的 CDN 地址，不经过实例。拿去直接请求之前，有三件事要知道，每个作品的 `media.access` 会告诉你其中两件：
+
+```json
+"access": { "referer": "https://www.douyin.com/", "session_bound": false }
+```
+
+- **`referer`：CDN 要核对的 Referer。** 抖音的 `douyinvod.com` 不带 `Referer: https://www.douyin.com/` 一律 403。所以把链接贴进浏览器地址栏（不带 Referer）会 403，在自己网页里用 `<video>` 播放（带的是你自己站点的 Referer）也会 403。B 站同理，要带 `https://www.bilibili.com/`。
+- **`session_bound`：链接绑定了取到它的那个会话。** TikTok 视频链接里带着 `tk=tt_chain_token`，CDN 只在请求带上取链接那个会话的 `tt_chain_token` Cookie 时才给文件，其他人一律 403，带对 Referer 也没用。其中 `www.tiktok.com/aweme/v1/play/` 开头的几个镜像会跳转到一份不绑定会话的视频，但只在部分出口上是这样，在别的出口上跳到的是网页。这个 Cookie 属于实例身份池里的某个身份，不会交给调用方。这类作品请用 [`POST /api/v1/downloads`](./08-downloads-and-library.md) 存下来，下载器会带上它需要的东西。
+- **链接会过期。** 抖音链接路径里有一段十六进制的 Unix 时间戳，就是到期时间，签发后大约几个小时；TikTok 的在查询串的 `expire=` 里。过期之后换哪个域名、带什么头都是 403，重新解析一次（`?refresh=true`）拿新的。
+
+`/api/v1/downloads` 会自己处理这三件事：带上对应的 Referer，TikTok 作品先重新取一次详情再带着那个会话的 token 下载，存下来的链接过期了也会先重新解析。只想要文件的话，用它比自己拿链接省事。
 
 ## `?include_raw=`
 

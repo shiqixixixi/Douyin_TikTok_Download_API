@@ -393,7 +393,7 @@ Every failure is the same envelope with `success: false`. Branch on `error.code`
 | `INTERNAL` | 500 | **yes** | Unexpected; quote `X-Request-ID` in a bug report |
 | `UPSTREAM_RISK_CONTROL` | 502 | **yes** | The platform flagged the request; the identity is cooling down |
 | `UPSTREAM_CHANGED` | 502 | no | The platform's response no longer matches the parser; `details.path` names the field. Report it |
-| `SIGNING_FAILED` | 502 | **yes** | Signing failed; the algorithm may be out of date |
+| `SIGNING_FAILED` | 502 | **yes** | Signing failed; the algorithm may be out of date. `details.cause: user_agent_mismatch` says otherwise: the identity's User-Agent is not browser-rpc's, and it could not be signed natively - a retry succeeds only if it is served by another identity; see [Troubleshooting](./14-troubleshooting.md#browser-rpc-refusals-in-the-api-and-worker-logs) |
 | `UPSTREAM_UNREACHABLE` | 502 | **yes** | Every attempt failed on the network before the platform answered; `details.proxied` says whether the last one went through a proxy. Usually this host's egress, not the platform |
 | `IDENTITY_POOL_EXHAUSTED` | 503 | **yes** | No identity free; `retry_after` estimates the recovery |
 | `IDENTITY_LOGIN_REQUIRED` | 503 | no | The request needs a logged-in identity and rotation has none - later pages of a Douyin author's posts, or of a Bilibili video's comments or replies, and every page of a Douyin author's likes. `details.cooling` counts the logged-in ones cooling down. Fixed by importing one, not by retrying; see [Identities](./06-identities-and-proxies.md#what-needs-a-logged-in-identity) |
@@ -456,6 +456,20 @@ Two separate mechanisms make a repeated request cheap, and both are on by defaul
 **`?refresh=true` turns off both.** It ignores any cached or in-flight answer and asks upstream again. The fresh answer is still written to the cache — "do not read the cache" and "do not keep this" are different requests, and only the first one was asked for. It costs an identity and a real upstream request, so it is for checking whether something changed, not for every call.
 
 Both mechanisms are why two spellings of the same request coalesce: `?url=https://www.douyin.com/video/7123…` and `?aweme_id=7123…` extract to the same parameters and get the same task id.
+
+## Using media links directly
+
+`media.video.url`, `media.streams[].url` and the rest are the platform's own signed CDN URLs; they do not go through the instance. Three things are worth knowing before you fetch one yourself, and each post's `media.access` states two of them:
+
+```json
+"access": { "referer": "https://www.douyin.com/", "session_bound": false }
+```
+
+- **`referer`: the Referer the CDN checks.** Douyin's `douyinvod.com` answers 403 to any request without `Referer: https://www.douyin.com/`. So a link pasted into a browser's address bar (no Referer) gets a 403, and so does a `<video>` on your own page (your site's Referer). Bilibili is the same with `https://www.bilibili.com/`.
+- **`session_bound`: the links are bound to the session that fetched them.** TikTok's video links carry `tk=tt_chain_token`, and its CDN serves the file only to a request carrying that session's `tt_chain_token` cookie. Everyone else gets a 403, with or without the right Referer. The mirrors among them starting `www.tiktok.com/aweme/v1/play/` redirect to an unbound copy of the video - from some exits; from others they land on a web page. The cookie belongs to an identity in the instance's pool and is not handed to callers. Store such a post with [`POST /api/v1/downloads`](./08-downloads-and-library.md); the downloader sends what it needs.
+- **The links expire.** A Douyin link has a hexadecimal Unix timestamp in its path, its expiry, a few hours after it was issued; TikTok's is `expire=` in the query string. Once expired, no host and no header will get you a 200 — parse again (`?refresh=true`) for fresh ones.
+
+`/api/v1/downloads` handles all three on its own: it sends the right Referer, fetches a TikTok post again and downloads with that session's token, and re-parses a post whose stored links have aged out. If what you want is the file, it is less work than handling the links yourself.
 
 ## `?include_raw=`
 

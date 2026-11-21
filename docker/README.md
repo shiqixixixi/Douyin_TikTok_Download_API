@@ -395,8 +395,35 @@ POST /rpc/mint    {platform, proxy_url, geo_hint}
 POST /rpc/sign    {platform, url, query, params, user_agent}
                 → {a_bogus | x_bogus | signature, ms_token}
 GET  /rpc/health  → {status, backend, backend_version, chromium_major,
-                     warm_contexts, uptime}
+                     user_agent, warm_contexts, uptime}
 ```
+
+A signature carries the signing page's own User-Agent, whatever the request
+names: the page runs under its browser binary's `navigator.userAgent`, and
+`/rpc/sign` answers with that string. A `user_agent` the platform would not
+accept that signature for - an identity minted under another browser, or
+imported - is refused with `409 user_agent_mismatch` instead of being signed,
+and dtk then signs that identity natively where its settings allow. On TikTok
+that is any other string: it refuses a request whose User-Agent is not the
+one its signature sealed. On Douyin it is one naming another operating
+system: measured on 2026-11-20, Douyin accepted the page's signature for
+identities on other Chrome majors and on Edge, and refused it for a query
+naming macOS, which dtk builds from a macOS identity's User-Agent.
+`/rpc/health` reports the string once a page has opened.
+
+Upgrade browser-rpc together with api and worker - they share
+`DTK_IMAGE_TAG`, and `dtkctl upgrade` moves them together; nothing checks the
+pairing at run time. An api/worker from 5.1.12 or earlier against this
+browser-rpc fails on both platforms: its self-check asks for references under
+a fixed User-Agent, so both of its signing steps report
+`signing_reference_failed`; it reads a 409 as a browser failure, so TikTok
+identities minted under another browser fail with `SIGNING_FAILED` instead of
+being signed natively; and it refuses any answer whose User-Agent differs
+from the one it asked for, so Douyin identities on any other User-Agent string
+fail too, although this service signed them. The other way round, this
+api/worker against a browser-rpc from 5.1.12 or earlier gets back the
+User-Agent it asked for rather than the page's, which is the #832 behaviour:
+TikTok refuses those signatures as risk control.
 
 The clients are `dtk.identity.minting.client.BrowserRpcClient` and
 `dtk.signing.rpc.RpcSigner`; `docker/browser_rpc/tests/test_rpc_api.py` drives
@@ -602,7 +629,8 @@ procedure follows `docs/design/16-salvage-and-debug.md`.
            signer = RpcSigner(c, 'http://browser-rpc:9000')
            spec = RequestSpec.get('https://www.douyin.com/aweme/v1/web/aweme/detail/',
                                   params={'aweme_id': '7'})
-           print(await signer.sign(spec, StaticFingerprint(user_agent='Mozilla/5.0')))
+           # Empty takes the page's own User-Agent, which every platform accepts.
+           print(await signer.sign(spec, StaticFingerprint(user_agent='')))
    asyncio.run(main())"
    ```
 

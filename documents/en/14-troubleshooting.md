@@ -88,6 +88,7 @@ docker compose -p dtk -f docker/compose.yml exec api dtk diagnose \
 | browser-rpc is down or was never started | [The browser container is unavailable](#the-browser-container-is-unavailable) |
 | Building the browser image hangs at `Downloading from https://cloakbrowser.dev/…` | [The build hangs downloading Chromium](#the-build-hangs-downloading-chromium) |
 | Downloads fail, or the files are not there | [Downloads fail or files are missing](#downloads-fail-or-files-are-missing) |
+| Fetching `media.video.url` directly answers `403` | [A media link answers 403 when fetched directly](#a-media-link-answers-403-when-fetched-directly) |
 | A download's progress counts files and never bytes, or a Bilibili download ends `partial` with an empty video | [Progress counts only files, or a Bilibili video lands empty](#progress-counts-only-files-or-a-bilibili-video-lands-empty) |
 | Collection stopped on its own; `CAPACITY_PAUSED` alert | [The disk is full](#the-disk-is-full) |
 | A proxy is marked unhealthy | [Proxies fail their probe](#proxies-fail-their-probe) |
@@ -794,7 +795,7 @@ Every platform request is signed with a pure-Python reimplementation of the plat
 
 | Symptom | What it is |
 |---|---|
-| `SIGNING_FAILED` (502) | No usable signer at all, or the signer raised. The clearest case, and the rarest |
+| `SIGNING_FAILED` (502) | No usable signer at all, or the signer raised. The clearest case, and the rarest. `details.cause: user_agent_mismatch` is the one cause it names: see [browser-rpc refusals in the logs](#browser-rpc-refusals-in-the-api-and-worker-logs) |
 | HTTP 200, empty or hollow body, header `tt_orcas_res` present | TikTok refusing a request whose signature did not verify. Classified `signature.rejected` |
 | HTTP 403 with `Blocked by ArgusSecurityPlugin …` in the body | Douyin refusing a signature that is missing or does not cover the request. Classified `signature.refused`. The body carries one of `uifid not found`, `signature not found`, `sign invalid`, `sign expired` |
 
@@ -808,10 +809,35 @@ Step 5 signs the same request twice — once with the native algorithm, once thr
 |---|---|---|
 | `signing_ok` | Native and browser signatures agree | Nothing |
 | `signing_mismatch` | The native algorithm has drifted from the platform's, for the named platforms | Those platforms now sign through browser-rpc. Open an issue with the report attached so the algorithm can be updated |
-| `signing_not_comparable` | The browser reference implements a *different version* of the algorithm, so a structural comparison says nothing either way | **Not a fault.** The native path is unaffected and still serves requests |
+| `signing_native_failed` | The native signer could not sign the probe request | A fault in dtk's port, on the path that serves traffic. Open an issue with the report attached |
+| `signing_reference_failed` | browser-rpc could not produce the reference signature; the finding quotes its reason | **Not a fault in the native signer**, which still serves requests. Fix browser-rpc (see below) and run the check again |
+| `signing_build_drift` | Both signed, and the browser's signature names a different build of the platform's SDK than the native one (TikTok's `X-Dynosaur` carries it); the finding names both | The native signer keeps serving and is deliberately not switched off: the platform accepted the previous build when last measured, and switching would cost more than the stale build does. Update dtk; if the latest release still signs as the old build, open an issue with the report attached |
+| `signing_not_comparable` | Both signed, but nothing they share can be judged, or the comparison could not run; the details say which | **Not a fault.** The native path is unaffected and still serves requests |
 | `signing_no_browser_rpc` | browser-rpc is not configured, so there is no second signer | Set `DTK_BROWSER_RPC_URL` if you want this check. It is what detects a stale algorithm *before* the risk rate does |
 
-`signing_not_comparable` is the one most likely to be misread: "cannot compare" reads as a failure and is not one.
+`signing_not_comparable` and `signing_reference_failed` are the ones most likely to be misread: "cannot compare" reads as a failure of the signer and is not one.
+
+What `signing_reference_failed` quotes from browser-rpc, and what it means:
+
+| browser-rpc says | Meaning |
+|---|---|
+| `the tiktok signing page is no longer on tiktok.com (it is on chrome-error://…)` | The warm page loaded, then a navigation failed through its exit — `DTK_BROWSER_SIGN_PROXY_URL`, the identity's proxy, or this host. Check that exit can load the platform's site |
+| `could not load https://…` | The page never loaded through its exit. The rest of the line is Chromium's own error (`net::ERR_PROXY_CONNECTION_FAILED`, a timeout, …) |
+| `could not sign within …s` | The page stayed on the platform and its security bundle never signed: either the bundle did not load, or the platform changed how it signs. If the exit loads the site fine, it is the second — open an issue |
+| `…; both attempts failed this way, on two different pages …` | Not one stale page: the same failure on a fresh page. The note names what the two pages shared that fits the failure — `through the same exit` for a navigation, `loading the same platform bundle` for a page that never signed, `in the same browser container` for a crash |
+| `Target crashed`, `Page crashed`, `renderer crashed`, `… has been closed` | Chromium died, almost always for lack of memory or `/tmp` space in the browser container. A page killed while it was still loading says `Page crashed`, and a browser process that died says `Target page, context or browser has been closed`. browser-rpc writes `renderer crashed (Target crashed)` when it notices a crash itself, including in `browser_rpc.warm.discarded` log lines |
+| `browser-rpc unreachable` | No answer at all: the container is down or `DTK_BROWSER_RPC_URL` points nowhere |
+| `browser-rpc did not answer within …s` | browser-rpc is up, but its two attempts took longer than `signing.rpc_timeout_seconds` — usually an exit that hangs rather than refuses. Its own log has the reason: look for `browser_rpc.sign.open_failed` |
+
+### browser-rpc refusals in the api and worker logs
+
+Step 5 signs its reference anonymously, so these never reach the self-check. They are written by the api and worker while they serve requests, when browser-rpc declines one identity's request:
+
+| Log line | Meaning | What to do |
+|---|---|---|
+| `signing.rpc.user_agent_mismatch` (WARNING, once per identity and outcome, with its `identity_id`) | browser-rpc signs under its browser's own User-Agent, and this identity's is one the platform would not accept that signature for: on TikTok any other User-Agent, on Douyin one naming another operating system. It was minted under an older browser-rpc image, or imported from your browser. browser-rpc refused it (`409 user_agent_mismatch`) rather than sign a request the platform would refuse. With `signer=native` the request was signed natively, which works; in `rpc` mode the first such request on an endpoint also raises `signing.fallback.engaged` with the reason `browser-rpc cannot sign under this identity's User-Agent`. With `not_native=…` it was not, and the request failed - see the next row | Nothing, while native signing serves it. A minted identity can be retired and replaced by a fresh mint, which then carries the current browser's User-Agent |
+| `SIGNING_FAILED` with `details.cause: user_agent_mismatch` | The same identity, when it cannot be signed natively either. The line above says why in `not_native` - written again whenever the reason changes for that identity: `fallback_disabled` (`signing.fallback_enabled` is off), `native_disabled` (native signing was disabled for this platform after a shadow comparison found a mismatch - `signing.shadow.mismatch` in the log, or the self-check's `signing_mismatch` - and stays disabled until the worker restarts), `no_native` (this deployment has no native signer for the platform), or `protected` (only a browser can sign this request for this jar: on TikTok a jar with no `msToken`, whose native signatures were refused; on Douyin a sign-protected endpoint and a jar with no visitor id). The identity is not cooled down, so it keeps being leased and failing | A minted identity: retire it and mint a replacement. An imported one, often signed in: **do not retire it for this** - a mint makes a guest, and signed-in requests would then fail with `IDENTITY_LOGIN_REQUIRED`. Re-import its cookies from a browser whose User-Agent is the one browser-rpc's `/rpc/health` reports as `user_agent`, or turn `signing.fallback_enabled` back on |
+| `signing.rpc.refused` … `the tiktok signing page could not seal a usable msToken within …s` | The TikTok page loaded with this identity's token signs, but its SDK never got a usable token of its own to seal: `it seals one of 0 characters` means TikTok's app never answered through the exit the page loads through, `only the bootstrap token arrived` that it answered and never issued the full token. Such a page is not handed out before its token arrives, because until then the request would carry whatever token the identity's jar holds rather than the page's fresh one, and that token is what TikTok judges | Check that exit, as for a mint that fails on the same token |
 
 ### Reproduce a signature by hand
 
@@ -899,6 +925,8 @@ The service answers `/rpc/health` even when the browser backend failed to start 
 
 ### Chromium crashes with "Target crashed", and it reads like a platform block
 
+browser-rpc reports a crash it noticed on its own as `renderer crashed (Target crashed)`; a page that crashed while idle is dropped with a `browser_rpc.warm.discarded … reason=its renderer crashed (Target crashed)` line. If the container itself restarts or `docker inspect` shows `OOMKilled`, the container's memory limit is what ran out, not `/tmp`.
+
 The driver passes `--disable-dev-shm-usage`, so every renderer's shared memory lands in the container's `/tmp` tmpfs, not `/dev/shm`. Each resident context holds roughly 290 MB of deleted-but-open files — invisible to `du`, visible to `df`. The tmpfs is sized 3 GB for that reason. The rough ceiling is `300M × DTK_BROWSER_WARM_CONTEXTS × 2 platforms`, plus a mint in flight. If you raised `DTK_BROWSER_WARM_CONTEXTS`, raise the tmpfs with it — and remember it is RAM, not free disk.
 
 ### Chromium and emulation version drift
@@ -967,13 +995,41 @@ Two mechanisms delete media, and both announce themselves:
 
 The maintenance sweep runs every 300 seconds and settles downloads older than 7200 seconds that are still in a live state, marking them `failed` with *the worker never reported an outcome for this download*. Files that did land stay where they are. If it never settles, the worker is not running.
 
+### A TikTok video fails with a row of `answered 403`
+
+TikTok's video links are served only to the session that fetched them: the request that asked for them has to carry that session's own `device_id`, and the download has to carry the same session's `tt_chain_token` (see [A media link answers 403 when fetched directly](#a-media-link-answers-403-when-fetched-directly)). So the first time a TikTok identity is used, the instance opens TikTok's home page as that identity once and keeps the device id it states; and a TikTok download always fetches the post again and downloads with that identity's `tt_chain_token`. A reason reading `all N mirrors failed: … answered 403` means that did not work out:
+
+- The fresh fetch failed (an empty pool, risk control), so the download fell back to the archived links, which do not accept this session. Press **Retry** on the download's row on `/downloads` once the pool has recovered.
+- The identity's device id could not be read. The worker log has `fetch.device_id.unread`, and the page is asked again after an hour; if it never is, retire the identity and let the pool mint another.
+- The identity's jar has no `tt_chain_token`. The worker log's `media.download.bound_cookies` line shows an empty `carried`. Retire it as well.
+- The identity goes out through a proxy, the downloader goes direct, and the CDN also checks the exit address. Not measured so far; if you meet it, open an issue with those log lines.
+
+5.1.11 and earlier made up a device id for every request, so no session could open the CDN links it got, and a download depended on the `www.tiktok.com/aweme/v1/play/` mirrors further down the list. Those redirect - to an unbound copy of the video from some exits, to a web page from others. The old versions also reported only the last mirror's reason, so what you saw was `www.tiktok.com answered content-type "text/html…"` while the mirrors before it had all answered 403.
+
 ### The links expired before the transfer started
 
-Signed CDN links expire within hours. `media.mirror_max_age_seconds` (600) is how old an archived media link may be before a download re-parses the post to get fresh ones; `0` always re-parses.
+Signed CDN links expire within hours. `media.mirror_max_age_seconds` (600) is how old an archived media link may be before a download re-parses the post to get fresh ones; `0` always re-parses. A TikTok post ignores the setting and is re-parsed on every download, for the reason in the section above.
 
 ### The API will not serve me the file
 
 By design for the downloader: it is a sink, never a relay. The API mounts the media volume read-only and serves stored files to the console behind the `media:read` scope; the downloader itself never relays media to callers. See [Downloads, library and watchlist](./08-downloads-and-library.md).
+
+---
+
+## A media link answers 403 when fetched directly
+
+**Symptom.** `media.video.url` from a parse result, fetched directly - opened in a browser, with curl, in a `<video>` on your own page, from a client in another language - answers `403 Forbidden`.
+
+**What it means.** These are the platform's signed CDN URLs, and the CDNs check more than the signature. Each post's `media.access` says what is needed; the API guide's [Using media links directly](./11-api.md#using-media-links-directly) has the details:
+
+| Platform | Why the 403 | What to do |
+|---|---|---|
+| Douyin | No `Referer: https://www.douyin.com/`. A browser's address bar sends none, and a `<video>` on a web page sends your own site's, so both get a 403 | Send `media.access.referer` with the request. To play it in a page, have your backend relay it with that header |
+| Bilibili | The same, with `https://www.bilibili.com/` | The same |
+| TikTok | `media.access.session_bound` is `true`: the link carries `tk=tt_chain_token` and is served only to the session that fetched it | A caller cannot have that session's cookie; store the post with `POST /api/v1/downloads`. The mirrors starting `www.tiktok.com/aweme/v1/play/` work directly from some exits, with no promise |
+| Any | The link has expired. The hexadecimal segment in a Douyin path is its expiry as a Unix timestamp; TikTok's is `expire=` in the query string | Parse again with `?refresh=true` |
+
+`referrerpolicy="no-referrer"` does not help with Douyin any more: no Referer gets the same 403 as a wrong one.
 
 ---
 

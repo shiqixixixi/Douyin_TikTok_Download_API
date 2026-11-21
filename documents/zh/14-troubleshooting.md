@@ -87,6 +87,7 @@ docker compose -p dtk -f docker/compose.yml exec api dtk diagnose \
 | browser-rpc 挂了或者根本没启动 | [浏览器容器不可用](#浏览器容器不可用) |
 | 构建浏览器镜像卡在 `Downloading from https://cloakbrowser.dev/…` | [构建卡在下载 Chromium](#构建卡在下载-chromium) |
 | 下载失败，或者文件不在 | [下载失败或者文件不见了](#下载失败或者文件不见了) |
+| 拿 `media.video.url` 直接请求返回 `403` | [直接请求媒体链接返回 403](#直接请求媒体链接返回-403) |
 | 下载进度只数文件、从不显示字节，或者 B 站下载以 `partial` 结束、视频是空的 | [进度只数文件，或者 B 站视频落地是空的](#进度只数文件或者-b-站视频落地是空的) |
 | 采集自己停了；收到 `CAPACITY_PAUSED` 告警 | [磁盘满了](#磁盘满了) |
 | 某个代理被标成不健康 | [代理探测失败](#代理探测失败) |
@@ -760,7 +761,7 @@ docker compose -p dtk -f docker/compose.yml exec api dtk fetch --raw \
 
 | 症状 | 是什么 |
 |---|---|
-| `SIGNING_FAILED`（502） | 完全没有可用签名器，或者签名器抛错。最清楚，也最少见 |
+| `SIGNING_FAILED`（502） | 完全没有可用签名器，或者签名器抛错。最清楚，也最少见。它唯一会点名的原因是 `details.cause: user_agent_mismatch`：见 [api 和 worker 日志里的 browser-rpc 拒绝](#api-和-worker-日志里的-browser-rpc-拒绝) |
 | HTTP 200，body 为空或是空壳，带 `tt_orcas_res` 响应头 | TikTok 在拒绝一个签名没通过校验的请求。判为 `signature.rejected` |
 | HTTP 403，body 里有 `Blocked by ArgusSecurityPlugin …` | 抖音在拒绝一个缺失或覆盖不到位的签名。判为 `signature.refused`，body 里会带 `uifid not found`、`signature not found`、`sign invalid`、`sign expired` 之一 |
 
@@ -774,10 +775,35 @@ docker compose -p dtk -f docker/compose.yml exec api dtk fetch --raw \
 |---|---|---|
 | `signing_ok` | 原生与浏览器签名一致 | 无需处理 |
 | `signing_mismatch` | 原生算法相对平台已经漂移，针对列出的平台 | 这些平台现在改走 browser-rpc 签名。带上报告开一个 issue，好把算法更新掉 |
-| `signing_not_comparable` | 浏览器参考实现的是算法的**另一个版本**，结构性比对说明不了任何问题 | **这不是故障。** 原生路径不受影响，仍然照常服务请求 |
+| `signing_native_failed` | 原生签名器无法为探测请求签名 | 这是 dtk 移植实现的缺陷，出在承载流量的那条路径上。带上报告开一个 issue |
+| `signing_reference_failed` | browser-rpc 没能产出参考签名，结论里引用了它给出的原因 | **不是原生签名器的故障**，它仍然照常服务请求。先修好 browser-rpc（见下表），再跑一次自检 |
+| `signing_build_drift` | 两边都签了名，但浏览器签名里写的平台 SDK 版本与原生签名不同（TikTok 的 `X-Dynosaur` 带着它），结论里写明了两个版本 | 原生签名器继续服务，而且有意不被停用：上次实测时平台仍接受旧版本，切换的代价比旧版本本身更大。请升级 dtk；如果最新版本仍按旧版本签名，带上报告开一个 issue |
+| `signing_not_comparable` | 两边都签了名，但共有的参数里没有可判定的，或者比对本身没能运行，详情里写明是哪一种 | **这不是故障。** 原生路径不受影响，仍然照常服务请求 |
 | `signing_no_browser_rpc` | 没配 browser-rpc，因此没有第二个签名器 | 想要这项检查就设 `DTK_BROWSER_RPC_URL`。它的价值在于抢在风控率之前发现算法过期 |
 
-`signing_not_comparable` 最容易被误读：「无法比对」读起来像失败，但它不是。
+`signing_not_comparable` 和 `signing_reference_failed` 最容易被误读：「无法比对」读起来像签名器坏了，但它不是。
+
+`signing_reference_failed` 引用的 browser-rpc 原话及其含义：
+
+| browser-rpc 的原话 | 含义 |
+|---|---|
+| `the tiktok signing page is no longer on tiktok.com (it is on chrome-error://…)` | 常驻页面加载完之后，经由它的出口（`DTK_BROWSER_SIGN_PROXY_URL`、身份自带的代理或本机）进行的一次跳转失败了。检查这个出口能否正常打开平台站点 |
+| `could not load https://…` | 页面根本没能经由它的出口加载出来。后半句是 Chromium 自己的报错（`net::ERR_PROXY_CONNECTION_FAILED`、超时等） |
+| `could not sign within …s` | 页面一直停在平台上，但它的安全 bundle 始终没签出名：要么 bundle 没加载上，要么平台改了签名方式。如果这个出口能正常打开站点，那就是后者——请开一个 issue |
+| `…; both attempts failed this way, on two different pages …` | 不是某一个页面过期：换了新页面也是同样的失败。后半句写的是两个页面共有、且与这种失败对得上的东西——跳转失败写 `through the same exit`，始终签不出名写 `loading the same platform bundle`，崩溃写 `in the same browser container` |
+| `Target crashed`、`Page crashed`、`renderer crashed`、`… has been closed` | Chromium 崩了，几乎总是浏览器容器的内存或 `/tmp` 空间不够。页面还在加载时被杀掉会写 `Page crashed`，浏览器进程本身死掉会写 `Target page, context or browser has been closed`。browser-rpc 自己发现崩溃时写的是 `renderer crashed (Target crashed)`，`browser_rpc.warm.discarded` 日志行里也是这样 |
+| `browser-rpc unreachable` | 完全没有响应：容器没在运行，或者 `DTK_BROWSER_RPC_URL` 指错了地方 |
+| `browser-rpc did not answer within …s` | browser-rpc 在运行，但它的两次尝试加起来超过了 `signing.rpc_timeout_seconds`，通常是出口卡住而不是直接拒绝。原因在它自己的日志里：找 `browser_rpc.sign.open_failed` |
+
+### api 和 worker 日志里的 browser-rpc 拒绝
+
+第 5 步的参考签名是匿名签的，所以下面这些永远不会出现在自检里。它们由 api 和 worker 在服务请求时写出，表示 browser-rpc 拒绝了某一个身份的请求：
+
+| 日志行 | 含义 | 该做什么 |
+|---|---|---|
+| `signing.rpc.user_agent_mismatch`（WARNING，每个身份每种结果一次，带 `identity_id`） | browser-rpc 只能以它浏览器自己的 User-Agent 签名，而平台不会为这个身份的 UA 接受这样的签名：TikTok 上是任何不同的 UA，抖音上是写着另一种操作系统的 UA。这个身份是在更早的 browser-rpc 镜像下铸造的，或是从你的浏览器导入的。browser-rpc 拒绝为它签名（`409 user_agent_mismatch`），而不是签出一个平台必定拒绝的请求。带 `signer=native` 时，请求已改由原生签名，原生签名照样可用；`rpc` 模式下，每个接口第一次这样改道还会发出 `signing.fallback.engaged`，原因是 `browser-rpc cannot sign under this identity's User-Agent`。带 `not_native=…` 时则没有改道，请求失败了——见下一行 | 原生签名能服务它时，什么都不用做。铸造出来的身份可以退役、再铸造一个新的，新身份会带着当前浏览器的 User-Agent |
+| `SIGNING_FAILED`，带 `details.cause: user_agent_mismatch` | 同一种身份，而且也没法原生签名。上一行的 `not_native` 写明了原因，这个身份的原因一变就会再写一行：`fallback_disabled`（`signing.fallback_enabled` 关着）、`native_disabled`（影子比对发现不一致后，这个平台的原生签名被停用了——日志里的 `signing.shadow.mismatch`，或者自检的 `signing_mismatch`——在 worker 重启之前一直停用）、`no_native`（这个部署里该平台没有原生签名器），或 `protected`（这个请求配这个 jar 只有浏览器能签：TikTok 上是 jar 里没有 `msToken`，不带 token 的原生签名被拒过；抖音上是受签名保护的接口，而 jar 里没有访客 ID）。这个身份不会进入冷却，所以会一直被派出去、一直失败 | 铸造出来的身份：退役它，再铸造一个。导入的身份（常常是登录态）：**不要为此退役它**——铸造出来的是游客，需要登录的请求随后会以 `IDENTITY_LOGIN_REQUIRED` 失败。改为从一个 User-Agent 与 browser-rpc 的 `/rpc/health` 里 `user_agent` 相同的浏览器重新导入它的 Cookie，或者把 `signing.fallback_enabled` 打开 |
+| `signing.rpc.refused` … `the tiktok signing page could not seal a usable msToken within …s` | 载入了这个身份 token 的 TikTok 页面能签名，但它的 SDK 一直没拿到自己可用的 token 来封进签名：`it seals one of 0 characters` 说明 TikTok 的应用接口始终没有经由页面所走的出口应答，`only the bootstrap token arrived` 说明应答了、但始终没发下完整的 token。这样的页面在自己的 token 到来之前不会交出去，因为在那之前，请求带的是身份 jar 里现有的 token 而不是页面新鲜的那个，而 TikTok 看的正是这个 token | 检查这个出口，和 mint 因同一个 token 失败时一样 |
 
 ### 手工复现一个签名
 
@@ -860,6 +886,8 @@ CloakBrowser 的下载地址，也连不上它跳转去的 GitHub Release，而 
 
 ### Chromium 崩溃 报错 Target crashed 看起来像被平台封了
 
+browser-rpc 自己发现的崩溃会写成 `renderer crashed (Target crashed)`；空闲时崩掉的页面会被丢弃，并留下一行 `browser_rpc.warm.discarded … reason=its renderer crashed (Target crashed)`。如果容器本身重启了，或者 `docker inspect` 显示 `OOMKilled`，用完的是容器的内存上限，而不是 `/tmp`。
+
 驱动自己带了 `--disable-dev-shm-usage`，所以每个渲染进程的共享内存落在容器的 `/tmp` tmpfs 上，而不是 `/dev/shm`。每个常驻上下文占着大约 290 MB 的「已删除但仍打开」的文件——`du` 看不见，`df` 看得见。tmpfs 因此被设成 3 GB。粗略的上限是 `300M × DTK_BROWSER_WARM_CONTEXTS × 2 个平台`，再加上一次进行中的铸造。如果你调大了 `DTK_BROWSER_WARM_CONTEXTS`，就把 tmpfs 一起调大——并且记住那是内存预算，不是空闲磁盘。
 
 ### Chromium 与模拟指纹的版本漂移
@@ -928,13 +956,41 @@ docker compose -p dtk -f docker/compose.yml exec api dtk --version
 
 维护巡检每 300 秒跑一次，把创建超过 7200 秒仍处于活动状态的下载结算为 `failed`，错误信息是 *the worker never reported an outcome for this download*。已经落地的文件原地保留。如果它一直不被结算，说明 worker 没在跑。
 
+### TikTok 视频失败，原因里是一串 `answered 403`
+
+TikTok 的视频链接只给取到它的那个会话：取链接时请求里带的 `device_id` 必须是这个会话自己的，下载时还要带上同一个会话的 `tt_chain_token`（见[直接请求媒体链接返回 403](#直接请求媒体链接返回-403)）。所以每个 TikTok 身份第一次被用到时，实例会用它打开一次 TikTok 首页，读出它的 device id 存下来；下载 TikTok 作品时总会重新取一次详情，再带着那个身份的 `tt_chain_token` 去下载。原因里如果是 `all N mirrors failed: … answered 403`，说明这一步没走通：
+
+- 重新取详情失败了（身份池空、被风控），只能退回归档里的旧链接，而旧链接不认这次的会话。等池子恢复后在 `/downloads` 点**重试**。
+- 没读到那个身份的 device id。worker 日志里会有 `fetch.device_id.unread`，一小时后会再读一次；一直读不到的话，退役这个身份让池子重新铸造。
+- 那个身份的 jar 里没有 `tt_chain_token`。worker 日志里 `media.download.bound_cookies` 这一行的 `carried` 会是空的。同样退役它。
+- 身份走代理、下载器直连，而 CDN 同时核对出口 IP。目前还没有实测到这种情况，遇到了请带着这几行日志开 issue。
+
+5.1.11 及更早的版本每次请求都随机编一个 device id，拿到的 CDN 链接谁都打不开，下载全靠排在后面的 `www.tiktok.com/aweme/v1/play/` 镜像。那个地址会跳转：从有的出口跳到一份不绑定会话的视频，从有的出口跳到网页。旧版本还只报最后一个镜像的原因，于是看到的是 `www.tiktok.com answered content-type "text/html…"`，其实前面的镜像都是 403。
+
 ### 传输还没开始链接就过期了
 
-签名的 CDN 链接几小时内就会失效。`media.mirror_max_age_seconds`（600）规定归档里的媒体链接最多可以多旧，超过就重新解析作品拿新链接；`0` 表示总是重新解析。
+签名的 CDN 链接几小时内就会失效。`media.mirror_max_age_seconds`（600）规定归档里的媒体链接最多可以多旧，超过就重新解析作品拿新链接；`0` 表示总是重新解析。TikTok 作品不看这个设置，每次下载都重新解析，原因见上一节。
 
 ### API 不肯把文件给我
 
 这是下载器的设计：它只负责把字节落到磁盘上，不做中继。API 以只读方式挂载媒体卷，并在 `media:read` scope 后面把已存文件交给控制台；下载器本身从不向调用方中继媒体。见[下载、资料库与关注列表](./08-downloads-and-library.md)。
+
+---
+
+## 直接请求媒体链接返回 403
+
+**症状。** 解析结果里的 `media.video.url` 拿去直接请求（浏览器打开、curl、自己网页里的 `<video>`、别的语言的客户端），返回 `403 Forbidden`。
+
+**含义。** 这些是平台签过名的 CDN 地址，CDN 除了签名还核对别的东西。每个作品的 `media.access` 写明了要什么，详见 API 指南的[直接使用媒体链接](./11-api.md#直接使用媒体链接)：
+
+| 平台 | 403 的原因 | 怎么办 |
+|---|---|---|
+| 抖音 | 没带 `Referer: https://www.douyin.com/`。浏览器地址栏不带 Referer，网页里的 `<video>` 带的是你自己站点的，都会 403 | 请求时带上 `media.access.referer`。网页里播放的话，由你的后端带着这个头转发 |
+| B 站 | 同上，Referer 是 `https://www.bilibili.com/` | 同上 |
+| TikTok | `media.access.session_bound` 为 `true`：链接带 `tk=tt_chain_token`，只给取到它的那个会话 | 调用方拿不到那个会话的 Cookie，用 `POST /api/v1/downloads` 存下来。其中 `www.tiktok.com/aweme/v1/play/` 开头的镜像从有的出口能直接用，但不保证 |
+| 任意平台 | 链接过期了。抖音路径里那段十六进制数是到期的 Unix 时间戳；TikTok 看查询串里的 `expire=` | `?refresh=true` 重新解析 |
+
+`referrerpolicy="no-referrer"` 现在帮不了抖音：不带 Referer 和带错 Referer 一样是 403。
 
 ---
 

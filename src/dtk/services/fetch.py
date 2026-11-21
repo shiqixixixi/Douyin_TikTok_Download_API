@@ -30,7 +30,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 from urllib.parse import urlencode
@@ -51,7 +51,8 @@ from dtk.core.logging import get_logger
 from dtk.core.types import LoginNeed, Outcome, Platform
 from dtk.db.models import Identity as IdentityRow
 from dtk.db.models import RequestLog
-from dtk.identity.pool import IdentityPool
+from dtk.identity.pool import IdentityPool, LiveIdentity
+from dtk.identity.rotation import rotate
 from dtk.ops.masking import mask_url
 from dtk.platforms import PlatformAdapter, get_adapter
 from dtk.platforms.base import RequestSpec as PlatformRequestSpec
@@ -78,6 +79,25 @@ log = get_logger(__name__)
 #: failures before giving up. Small on purpose: if three separate egresses
 #: cannot reach the platform, the problem is not the identity.
 MAX_TRANSPORT_ATTEMPTS = 3
+
+#: How long an identity whose device id could not be read goes before the page
+#: is asked again. Long enough that a page the platform will not serve costs
+#: one request an hour per identity, not one per call.
+DEVICE_ID_RETRY_SECONDS = 3600.0
+
+#: Responses whose Set-Cookie an identity keeps: every one the platform
+#: answered, refusals included, as a browser would. Not a transport failure or
+#: a 5xx, where there is no answer from the platform to keep.
+#:
+#: Refusals were left out at first, on the theory that a risk page describes a
+#: visitor being turned away. Measured on 2026-11-20 it is the other way round
+#: on TikTok: each msToken carries a use budget (about 22 author_profile calls
+#: on a guest), the API sets a fresh one on most answers, and the refusal that
+#: spends the last of a budget - signature.rejected, an empty 200 with
+#: tt_orcas_res: 1 - carries a fresh one too. A jar that adopted it answered
+#: again on its next call; one that kept replaying its minted token was dead
+#: for good. That replayed token was #830's rejections.
+_KEEPS_NOTHING: frozenset[Outcome] = frozenset({Outcome.NETWORK_ERROR})
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,6 +307,9 @@ class FetchService:
         self._cooldown_base = cooldown_base
         self._cooldown_max = cooldown_max
         self._timeout = request_timeout
+        #: Identities whose device id could not be read, and when to try again.
+        #: In memory only: losing it on restart costs one extra page request.
+        self._device_id_retry_at: dict[str, float] = {}
 
     # -- one upstream call -------------------------------------------------
 
@@ -325,6 +348,9 @@ class FetchService:
             raise
 
         proxy_id: uuid.UUID | None = None
+        #: What the identity's device page set, carried by this call and kept
+        #: with its answer - see `_with_device_id` for why not before it.
+        carried: dict[str, str] = {}
         payload: dict[str, Any] | None = None
         status: int | None = None
         signer: str | None = None
@@ -356,6 +382,7 @@ class FetchService:
                 outcome = Outcome.NETWORK_ERROR
                 error_code = "identity_gone"
                 return _Attempt(lease=lease, outcome=outcome, error_code=error_code)
+            identity, carried = await self._with_device_id(session, adapter, identity)
             proxy_id = await _proxy_id_of(session, identity.id)
             proxied = identity.proxy_url is not None
             authenticated = identity.authenticated
@@ -415,6 +442,11 @@ class FetchService:
             outcome = classification.outcome
             rule = classification.rule
             error_code = _error_code_for(classification, payload)
+            if outcome not in _KEEPS_NOTHING:
+                await self._keep_cookies(
+                    session, identity, response, sealed=signed.cookies, carried=carried
+                )
+                carried = {}
         except TransportFailure as exc:
             outcome = Outcome.NETWORK_ERROR
             error_code = "transport_failure"
@@ -429,6 +461,11 @@ class FetchService:
             error_code = exc.code.value
             raise
         finally:
+            if carried:
+                # The call kept nothing of its own - no answer, or it raised
+                # before one - but the device page did answer, and what it set
+                # is kept the way any answer's is.
+                await self._absorb(session, lease.identity_id, carried)
             await self._scheduler.release(lease, outcome)
             await self._pool.record_outcome(
                 session,
@@ -463,6 +500,166 @@ class FetchService:
             proxied=proxied,
             authenticated=authenticated,
         )
+
+    async def _with_device_id(
+        self, session: AsyncSession, adapter: PlatformAdapter, identity: LiveIdentity
+    ) -> tuple[LiveIdentity, dict[str, str]]:
+        """``identity``, carrying the device id its platform issued its session.
+
+        Read once per identity, as that identity - its own jar, exit and TLS
+        profile - from a page that states it, and kept in the fingerprint. The
+        page is not scheduled or logged as a call: it is part of being a
+        visitor at all, the request a browser makes before any API call.
+
+        A failure leaves the identity as it was, and its requests go out with
+        a made-up id as they always did; the page is asked again after
+        :data:`DEVICE_ID_RETRY_SECONDS`, not on every call.
+
+        Also returns the cookies the page set that the jar would keep. The call
+        that follows carries them, as a browser's next request would, but they
+        are written with that call's own answer rather than here: writing locks
+        the identity's row until the caller commits, and the call is a signing
+        and an upstream round trip. Written here, as 5.1.12 did, every other
+        request on the identity waited for both whenever the page set a cookie
+        the jar did not hold - 1.9-2.0s of a 2.0s call, measured on Postgres
+        for #832, against 0.07s written with the answer.
+        """
+        page_url = adapter.device_id_page()
+        if page_url is None or identity.fingerprint.device_id:
+            return identity, {}
+        now = time.monotonic()
+        if self._device_id_retry_at.get(identity.id, 0.0) > now:
+            return identity, {}
+        sender = TransportIdentity(
+            id=identity.id,
+            platform=identity.platform,
+            cookies=identity.cookies,
+            fingerprint=identity.fingerprint,
+            proxy_url=identity.proxy_url,
+        )
+        device_id: str | None = None
+        response: RawResponse | None = None
+        try:
+            response = await self._transport.request(
+                sender,
+                TransportRequestSpec(
+                    url=page_url,
+                    headers={"Accept": "text/html,application/xhtml+xml"},
+                    endpoint=f"{identity.platform.value}.device_id",
+                ),
+                self._timeout,
+            )
+            if response.status == 200:
+                device_id = adapter.read_device_id(_text_of(response.body))
+        except TransportFailure as exc:
+            log.info(
+                "fetch.device_id.unreachable",
+                identity_id=identity.id,
+                error=type(exc.cause).__name__ if exc.cause else str(exc)[:120],
+            )
+        carried: dict[str, str] = {}
+        if response is not None and response.status < 500:
+            # The page is an answer like any other, and the call that follows
+            # goes out with what it set, as a browser's next request would. The
+            # same rules the pool writes by decide what that is, so the call
+            # never carries a value the jar would then refuse.
+            rotation = rotate(
+                identity.platform,
+                identity.cookies,
+                {
+                    name: value
+                    for name, value in response.set_cookies.items()
+                    if identity.cookies.get(name) != value
+                },
+            )
+            if rotation.changed:
+                carried = {name: rotation.jar[name] for name in rotation.changed}
+                identity = replace(identity, cookies=rotation.jar)
+        if not device_id:
+            self._device_id_retry_at[identity.id] = now + DEVICE_ID_RETRY_SECONDS
+            log.info("fetch.device_id.unread", identity_id=identity.id)
+            return identity, carried
+        self._device_id_retry_at.pop(identity.id, None)
+        await self._pool.remember_device_id(session, identity.id, device_id)
+        log.info("fetch.device_id.learned", identity_id=identity.id)
+        return (
+            replace(identity, fingerprint=replace(identity.fingerprint, device_id=device_id)),
+            carried,
+        )
+
+    async def _keep_cookies(
+        self,
+        session: AsyncSession,
+        identity: LiveIdentity,
+        response: RawResponse,
+        *,
+        sealed: Mapping[str, str] | None = None,
+        carried: Mapping[str, str] | None = None,
+    ) -> tuple[str, ...]:
+        """Keep what the platform set on ``response`` in the identity's jar.
+
+        Never at the cost of the response it came with: the request has already
+        spent the identity's rate budget, and a jar that missed one rotation
+        still answers. A failure is logged, not raised.
+
+        ``sealed`` are the cookies a signer put in place of the jar's for this
+        request - a browser page's own msToken. The platform's answer for
+        those names answers that page's session, not the identity's, and
+        writing it into the jar would have the next natively signed request
+        carry another session's token: on TikTok the one case worse than
+        sending none.
+
+        So an identity signed only by browser-rpc keeps the msToken it last
+        used natively (#832 review), and that is by design. A TikTok page with
+        a usable token always seals its own now, so the jar's is never sent and
+        is not spent: a token is spent by use, not by age (a 386-minute-old one
+        answered; docs/design/02-identity-pool.md). Keeping the answer's would
+        also change the jar on every call, and browser-rpc binds a page to the
+        whole jar, so every browser-signed call would rebind its page - 2.2s
+        against 12ms measured, before the readiness wait. If the jar's token
+        is spent by the time native signs it, the refusal carries a fresh one,
+        which is kept, and the identity's next call answers (4/4, doc 02).
+
+        A value the request already carried is not offered at all: the pool
+        reads the row under a lock to write it, and a platform re-sending what
+        the jar holds - TikTok's home page does it with tt_chain_token on every
+        load - is not worth one.
+
+        ``carried`` is what the identity's device page set before this request
+        (see `_with_device_id`), written here in the same lock; the response's
+        own value wins where both set a name.
+        """
+        offered = {
+            **(carried or {}),
+            **{
+                name: value
+                for name, value in response.set_cookies.items()
+                if name not in (sealed or {}) and identity.cookies.get(name) != value
+            },
+        }
+        return await self._absorb(session, identity.id, offered)
+
+    async def _absorb(
+        self, session: AsyncSession, identity_id: str, offered: Mapping[str, str]
+    ) -> tuple[str, ...]:
+        """`IdentityPool.absorb_cookies`, never at the cost of the response."""
+        if not offered:
+            return ()
+        try:
+            return await self._pool.absorb_cookies(session, identity_id, offered)
+        except Exception as exc:
+            # A database error here has already aborted the transaction, and
+            # the bookkeeping that follows fails on it with "current transaction
+            # is aborted"; the SQLSTATE is the only place the cause - a deadlock,
+            # say - is still named.
+            sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+            log.error(
+                "fetch.cookies.keep_failed",
+                identity_id=identity_id,
+                error=type(exc).__name__,
+                **({"sqlstate": sqlstate} if sqlstate else {}),
+            )
+            return ()
 
     def _classify(
         self, adapter: PlatformAdapter, endpoint: str, response: RawResponse
@@ -878,6 +1075,12 @@ def _follow_up_error(endpoint: str, outcome: Outcome, cooldown: int) -> DtkError
 
 def _elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
+
+
+def _text_of(body: Any) -> str:
+    if isinstance(body, bytes | bytearray | memoryview):
+        return bytes(body).decode("utf-8", errors="replace")
+    return str(body or "")
 
 
 def _reject_reason(exc: DtkError) -> str | None:
